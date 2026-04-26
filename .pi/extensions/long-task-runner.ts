@@ -28,6 +28,12 @@ interface AddTaskStepOptions {
 	modelPolicy?: string;
 }
 
+interface AddTaskStepResult {
+	task: LongTaskRecord;
+	step: LongTaskStep;
+	reused: boolean;
+}
+
 export interface LongTaskStep {
 	id: string;
 	title: string;
@@ -214,11 +220,21 @@ export function createLongTask(cwd: string, goal: string, title?: string): LongT
 }
 
 export function addTaskStep(cwd: string, taskId: string, title: string, options: AddTaskStepOptions = {}): LongTaskRecord {
+	return addOrReuseTaskStep(cwd, taskId, title, options).task;
+}
+
+function addOrReuseTaskStep(cwd: string, taskId: string, title: string, options: AddTaskStepOptions = {}): AddTaskStepResult {
 	const cleanTitle = title.trim();
 	if (!cleanTitle) {
 		throw new Error("Step title is required");
 	}
 	const task = readTask(cwd, taskId);
+	const matchingStep = findMatchingTaskStep(task, [cleanTitle, options.input ?? "", options.worker ?? "", options.modelPolicy ?? ""].join(" "));
+	if (matchingStep) {
+		appendTrace(task, "step_reused", `Reused existing step ${matchingStep.id}`);
+		writeTask(cwd, task);
+		return { task, step: matchingStep, reused: true };
+	}
 	const step: LongTaskStep = {
 		id: createStepId(task.plan.length, cleanTitle),
 		title: cleanTitle,
@@ -232,7 +248,7 @@ export function addTaskStep(cwd: string, taskId: string, title: string, options:
 	task.currentStepId = task.currentStepId ?? step.id;
 	appendTrace(task, "step_added", `Added step ${step.id}`);
 	writeTask(cwd, task);
-	return task;
+	return { task, step, reused: false };
 }
 
 export function addTaskArtifact(cwd: string, taskId: string, artifact: string): LongTaskRecord {
@@ -311,6 +327,151 @@ function formatTaskSummary(task: LongTaskRecord): string {
 	].filter((line): line is string => !!line).join("\n");
 }
 
+function isActiveTask(task: LongTaskRecord): boolean {
+	return task.status === "pending" || task.status === "running" || task.status === "blocked";
+}
+
+function taskSearchText(task: LongTaskRecord): string {
+	return [
+		task.title,
+		task.goal,
+		...task.plan.flatMap((step) => [step.id, step.title, step.input, step.output ?? ""]),
+		...task.artifacts,
+		...task.memoryKeys,
+	].join(" ");
+}
+
+function stepSearchText(step: LongTaskStep): string {
+	return [step.id, step.title, step.input, step.output ?? "", step.worker ?? "", step.modelPolicy ?? ""].join(" ");
+}
+
+const MATCH_STOP_WORDS = new Set([
+	"and",
+	"the",
+	"for",
+	"with",
+	"into",
+	"this",
+	"that",
+	"task",
+	"step",
+	"steps",
+	"worker",
+	"long",
+	"term",
+	"create",
+	"created",
+	"implement",
+	"implementation",
+	"layer",
+	"mvp",
+	"个人",
+	"任务",
+	"长期",
+	"实现",
+	"创建",
+	"纳入",
+	"第一版",
+]);
+
+function tokenizeForMatch(text: string): Set<string> {
+	const tokens = new Set<string>();
+	const normalized = text.toLowerCase().replace(/[_/.-]+/g, " ");
+	for (const match of normalized.matchAll(/[a-z0-9]+|[\u4e00-\u9fa5]{2,}/g)) {
+		const token = match[0];
+		if (token.length < 2 || MATCH_STOP_WORDS.has(token)) {
+			continue;
+		}
+		tokens.add(token);
+		addTokenAliases(tokens, token);
+	}
+	addPhraseAliases(tokens, normalized);
+	return tokens;
+}
+
+function addTokenAliases(tokens: Set<string>, token: string): void {
+	const aliases: Record<string, string[]> = {
+		dispatcher: ["dispatch", "dispatch-scope"],
+		dispatch: ["dispatch-scope"],
+		orchestration: ["orchestrate", "dispatch-scope"],
+		orchestrator: ["orchestrate", "dispatch-scope"],
+		routing: ["route", "dispatch-scope"],
+		router: ["route", "dispatch-scope"],
+		roles: ["role", "dispatch-scope"],
+		role: ["dispatch-scope"],
+		context: ["dispatch-scope"],
+		result: ["dispatch-scope"],
+		results: ["result", "dispatch-scope"],
+		merging: ["merge", "dispatch-scope"],
+		merge: ["dispatch-scope"],
+		complexity: ["dispatch-scope"],
+		classification: ["dispatch-scope"],
+	};
+	for (const alias of aliases[token] ?? []) {
+		tokens.add(alias);
+	}
+}
+
+function addPhraseAliases(tokens: Set<string>, normalized: string): void {
+	const phraseAliases: Array<[RegExp, string[]]> = [
+		[/multi\s+agent|多\s*agent|多智能体|多代理/, ["multi", "agent", "dispatch-scope"]],
+		[/协作编排|编排层|调度层|调度/, ["orchestrate", "dispatch", "dispatch-scope"]],
+		[/路由|分流/, ["route", "dispatch-scope"]],
+		[/角色|职责/, ["role", "dispatch-scope"]],
+		[/上下文/, ["context", "dispatch-scope"]],
+		[/结果合并|合并/, ["merge", "result", "dispatch-scope"]],
+		[/复杂度|分类/, ["complexity", "classification", "dispatch-scope"]],
+	];
+	for (const [pattern, aliases] of phraseAliases) {
+		if (pattern.test(normalized)) {
+			for (const alias of aliases) {
+				tokens.add(alias);
+			}
+		}
+	}
+}
+
+function findMatchingActiveTask(cwd: string, text: string): LongTaskRecord | undefined {
+	const queryTokens = tokenizeForMatch(text);
+	if (queryTokens.size === 0) {
+		return undefined;
+	}
+	let bestMatch: { task: LongTaskRecord; overlap: number } | undefined;
+	for (const task of listTasks(cwd).filter(isActiveTask)) {
+		const taskTokens = tokenizeForMatch(taskSearchText(task));
+		const overlap = [...queryTokens].filter((token) => taskTokens.has(token)).length;
+		if (overlap >= 2 && (!bestMatch || overlap > bestMatch.overlap)) {
+			bestMatch = { task, overlap };
+		}
+	}
+	return bestMatch?.task;
+}
+
+function tokenOverlap(left: Set<string>, right: Set<string>): number {
+	return [...left].filter((token) => right.has(token)).length;
+}
+
+function findMatchingTaskStep(task: LongTaskRecord, text: string): LongTaskStep | undefined {
+	const queryTokens = tokenizeForMatch(text);
+	if (queryTokens.size === 0) {
+		return undefined;
+	}
+	const activeStep = task.plan.find((step) => step.id === task.currentStepId)
+		?? task.plan.find((step) => step.status === "pending" || step.status === "running");
+	let bestMatch: { step: LongTaskStep; overlap: number } | undefined;
+	for (const step of task.plan) {
+		const stepTokens = tokenizeForMatch(stepSearchText(step));
+		const overlap = tokenOverlap(queryTokens, stepTokens);
+		const isActiveStep = activeStep?.id === step.id;
+		if ((isActiveStep && overlap >= 2) || overlap >= 3) {
+			if (!bestMatch || overlap > bestMatch.overlap) {
+				bestMatch = { step, overlap };
+			}
+		}
+	}
+	return bestMatch?.step;
+}
+
 function formatTaskDetails(task: LongTaskRecord): string {
 	const steps = task.plan.length === 0
 		? "No steps yet."
@@ -377,16 +538,24 @@ export function buildTaskRoutingSystemPrompt(cwd: string, userPrompt: string): s
 			const model = policy.provider && policy.model ? `${policy.provider}/${policy.model}` : "current/default model";
 			return `- ${name}: ${model}${policy.thinkingLevel ? `, thinking=${policy.thinkingLevel}` : ""}`;
 		});
+	const activeTaskLines = listTasks(cwd)
+		.filter(isActiveTask)
+		.slice(0, 8)
+		.map((task) => `- ${formatTaskSummary(task).replace(/\n/g, "\n  ")}`);
 	return [
 		"",
 		"# Personal Task Routing",
 		`Default mode: ${config.defaultMode ?? "immediate"}.`,
 		"Keep simple requests in immediate mode. Do not create long-task records for direct questions, small edits, or one-off commands.",
 		"Use the long_task tool only when work is complex, multi-step, interruptible, long-running, or explicitly asks for tracked/background progress.",
+		"Before creating a new long task, check the active long tasks below. If one already covers the user's request, reuse it by showing, resuming, or updating that existing task instead of creating a duplicate.",
+		"When an active task has a next pending/running step matching the user's request, continue that step and use the exact task id from the active task list.",
+		"Create a new long task only when no active task matches the goal.",
 		config.askWhenAmbiguous !== false
 			? "If a request is ambiguous and tracking would add overhead, ask the user before creating a long task."
 			: "When ambiguous, use your best judgment without asking.",
 		matchedKeywords.length > 0 ? `Current request matched long-task keyword(s): ${matchedKeywords.join(", ")}.` : undefined,
+		activeTaskLines.length > 0 ? `Active long tasks:\n${activeTaskLines.join("\n")}` : "Active long tasks: none.",
 		workerLines.length > 0 ? `Available worker hints:\n${workerLines.join("\n")}` : undefined,
 		modelPolicyLines.length > 0 ? `Available model policy hints:\n${modelPolicyLines.join("\n")}` : undefined,
 	].filter((line): line is string => !!line).join("\n");
@@ -438,7 +607,15 @@ function executeLongTaskAction(
 		throw new Error("Long-task runner is disabled by .pi/task-router.config.json");
 	}
 	if (params.action === "create") {
-		const task = createLongTask(cwd, requireString(params.goal, "goal"));
+		const goal = requireString(params.goal, "goal");
+		const matchingTask = findMatchingActiveTask(cwd, [goal, params.title ?? ""].join(" "));
+		if (matchingTask) {
+			return {
+				text: `Reused existing long task instead of creating a duplicate\n${formatTaskSummary(matchingTask)}`,
+				details: { reused: true, task: matchingTask },
+			};
+		}
+		const task = createLongTask(cwd, goal);
 		return { text: `Created long task\n${formatTaskSummary(task)}`, details: task };
 	}
 	if (params.action === "list") {
@@ -453,11 +630,17 @@ function executeLongTaskAction(
 		return { text: formatTaskDetails(task), details: task };
 	}
 	if (params.action === "add_step") {
-		const task = addTaskStep(cwd, requireString(params.taskId, "taskId"), requireString(params.title, "title"), {
+		const result = addOrReuseTaskStep(cwd, requireString(params.taskId, "taskId"), requireString(params.title, "title"), {
 			worker: params.worker,
 			modelPolicy: params.modelPolicy,
 		});
-		return { text: `Added step\n${formatTaskSummary(task)}`, details: task };
+		if (result.reused) {
+			return {
+				text: `Reused existing step instead of adding a duplicate\n${result.step.id}: ${result.step.title}\n${formatTaskSummary(result.task)}`,
+				details: { reused: true, task: result.task, step: result.step },
+			};
+		}
+		return { text: `Added step\n${formatTaskSummary(result.task)}`, details: result.task };
 	}
 	if (params.action === "set_task") {
 		const task = updateTaskStatus(
@@ -492,7 +675,13 @@ async function handleTaskCommand(args: string, ctx: ExtensionCommandContext): Pr
 			throw new Error("Long-task runner is disabled by .pi/task-router.config.json");
 		}
 		if (parsed.action === "create") {
-			const task = createLongTask(ctx.cwd, parsed.args.join(" "));
+			const goal = parsed.args.join(" ");
+			const matchingTask = findMatchingActiveTask(ctx.cwd, goal);
+			if (matchingTask) {
+				notify(ctx, `Reused existing long task instead of creating a duplicate\n${formatTaskSummary(matchingTask)}`);
+				return;
+			}
+			const task = createLongTask(ctx.cwd, goal);
 			notify(ctx, `Created long task\n${formatTaskSummary(task)}`);
 			return;
 		}
@@ -510,8 +699,13 @@ async function handleTaskCommand(args: string, ctx: ExtensionCommandContext): Pr
 		if (parsed.action === "add-step") {
 			const [taskId, ...titleParts] = parsed.args;
 			if (!taskId) throw new Error("Task id is required");
-			const task = addTaskStep(ctx.cwd, taskId, titleParts.join(" "));
-			notify(ctx, `Added step\n${formatTaskSummary(task)}`);
+			const result = addOrReuseTaskStep(ctx.cwd, taskId, titleParts.join(" "));
+			notify(
+				ctx,
+				result.reused
+					? `Reused existing step instead of adding a duplicate\n${result.step.id}: ${result.step.title}\n${formatTaskSummary(result.task)}`
+					: `Added step\n${formatTaskSummary(result.task)}`,
+			);
 			return;
 		}
 		if (parsed.action === "add-artifact") {
@@ -573,6 +767,7 @@ export default function longTaskRunnerExtension(pi: ExtensionAPI) {
 		promptGuidelines: [
 			"Use long_task only for complex, multi-step, long-running, interruptible, or explicitly requested tracked work.",
 			"Do not use long_task for simple questions, small one-off edits, or quick command execution.",
+			"Before create or add_step, inspect active task state and reuse an existing matching task or step instead of duplicating it.",
 			"Use long_task with action create before tracking a new long-running task, then add_step and set_step as progress is made.",
 			"Use long_task add_artifact to attach important files, URLs, notes, or outputs to the task record.",
 		],

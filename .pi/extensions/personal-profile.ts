@@ -64,8 +64,13 @@ export default function personalProfileExtension(pi: ExtensionAPI) {
 		const config = readProfileConfig(ctx.cwd);
 		const globalProfile = readOptionalFile(join(homedir(), ".pi", "agent", "profile.md"));
 		const projectProfile = readOptionalFile(join(ctx.cwd, ".pi", "profile.md"));
+		const projectStatus = readOptionalFile(join(ctx.cwd, ".pi", "project-status.md"));
 		const localProfile = readOptionalFile(join(ctx.cwd, ".pi", "profile.local.md"));
-		profileSection = formatProfileSection([globalProfile, projectProfile, localProfile], config.maxProfileChars);
+		const localStatus = readOptionalFile(join(ctx.cwd, ".pi", "project-status.local.md"));
+		profileSection = formatProfileSection(
+			[globalProfile, projectProfile, projectStatus, localProfile, localStatus].filter(Boolean),
+			config.maxProfileChars,
+		);
 	});
 
 	pi.on("before_agent_start", async (event) => {

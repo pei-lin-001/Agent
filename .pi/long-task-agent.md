@@ -53,6 +53,9 @@ Initial routing should be conservative:
 - Default: immediate mode.
 - Escalate automatically only for clearly complex tasks.
 - Ask the user when the request is ambiguous and the long-task overhead may be unnecessary.
+- Before creating a new long task, inspect active task records and reuse an existing matching task whenever possible.
+- If an active task's next pending or running step matches the user's request, continue that step instead of creating a duplicate task.
+- Create a new long task only when no active task covers the goal.
 
 Routing signals:
 
@@ -61,6 +64,23 @@ Routing signals:
 - The task is likely to touch many files or packages.
 - The task depends on external research plus code changes.
 - The task should survive process restarts or context loss.
+
+### Duplicate Avoidance
+
+The task runner should surface active tasks in the routing prompt so the model can compare the current request against existing work.
+
+Required behavior:
+
+- Reuse a running, pending, or blocked task whose title, goal, or next step already covers the user request.
+- Use `/task resume <taskId>` or the `long_task` `resume`/`show` actions to continue existing work.
+- Add steps or artifacts to the existing task when the user is refining the same project.
+- Before adding a new step, compare it with the existing plan. If the current pending or running step already covers the requested implementation slice, continue that step instead of adding narrower duplicate substeps.
+- Treat role setup, routing rules, context passing, result merging, and validation as part of an existing "multi-agent dispatch" step unless the user explicitly asks to split that step.
+- Do not create parallel top-level tasks for the same project direction.
+
+Example:
+
+If a task named `Personal Agent Multi-Capability Collaborative Platform Evolution` already has next step `Implement minimal viable multi-agent dispatch`, then a request such as "逐步实现多 agent 协作编排层" should continue that task instead of creating a new "Implement multi-agent orchestration" task.
 
 ## Long-Task Runner
 
