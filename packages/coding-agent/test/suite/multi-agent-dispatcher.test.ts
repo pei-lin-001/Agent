@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import multiAgentDispatcherExtension, {
 	type AgentDispatchDecision,
+	buildAgentStepDrafts,
 	classifyAgentRequest,
 	recommendAgentDispatch,
 } from "../../../../.pi/extensions/multi-agent-dispatcher.js";
@@ -112,6 +113,7 @@ describe("recommendAgentDispatch", () => {
 		expect(rec.action).toBe("answer_directly");
 		expect(rec.shouldCreateTask).toBe(false);
 		expect(rec.shouldPlanWorkers).toBe(false);
+		expect(rec.workerPlanHints).toEqual([]);
 	});
 
 	it("maps long_task mode to use_long_task with task creation but no worker planning", () => {
@@ -120,6 +122,7 @@ describe("recommendAgentDispatch", () => {
 		expect(rec.action).toBe("use_long_task");
 		expect(rec.shouldCreateTask).toBe(true);
 		expect(rec.shouldPlanWorkers).toBe(false);
+		expect(rec.workerPlanHints).toEqual([]);
 	});
 
 	it("maps multi_agent_candidate mode to plan_multi_agent with both task and worker planning", () => {
@@ -128,5 +131,54 @@ describe("recommendAgentDispatch", () => {
 		expect(rec.action).toBe("plan_multi_agent");
 		expect(rec.shouldCreateTask).toBe(true);
 		expect(rec.shouldPlanWorkers).toBe(true);
+		expect(rec.workerPlanHints.map((h) => h.role)).toEqual(["researcher", "coder", "tester", "reviewer"]);
+	});
+
+	it("appends docWriter to worker plan when prompt contains documentation signal", () => {
+		const rec = recommendAgentDispatch("我们要做多 agent 协作编排，包含调研、编码、测试、review，并更新 README 文档");
+		expect(rec.mode).toBe("multi_agent_candidate");
+		expect(rec.workerPlanHints.map((h) => h.role)).toEqual([
+			"researcher",
+			"coder",
+			"tester",
+			"reviewer",
+			"docWriter",
+		]);
+	});
+});
+
+describe("buildAgentStepDrafts", () => {
+	it("returns empty array for immediate mode prompts", () => {
+		const drafts = buildAgentStepDrafts("帮我解释一下 mem0 是干什么的");
+		expect(drafts).toEqual([]);
+	});
+
+	it("returns empty array for long_task mode prompts", () => {
+		const drafts = buildAgentStepDrafts("这个项目我要长期开发，帮我放进长期任务");
+		expect(drafts).toEqual([]);
+	});
+
+	it("returns 4 drafts for multi-agent prompt", () => {
+		const drafts = buildAgentStepDrafts("我们要做多 agent 协作编排，包含调研、编码、测试和 review");
+		expect(drafts).toHaveLength(4);
+		expect(drafts.map((d) => d.worker)).toEqual(["researcher", "coder", "tester", "reviewer"]);
+	});
+
+	it("returns 5 drafts for multi-agent prompt with documentation signal", () => {
+		const drafts = buildAgentStepDrafts(
+			"我们要做多 agent 协作编排，包含调研、编码、测试、review，并更新 README 文档",
+		);
+		expect(drafts).toHaveLength(5);
+		expect(drafts.map((d) => d.worker)).toEqual(["researcher", "coder", "tester", "reviewer", "docWriter"]);
+	});
+
+	it("each draft has title, worker, reason, and expectedOutput", () => {
+		const drafts = buildAgentStepDrafts("我们要做多 agent 协作编排，包含调研、编码、测试和 review");
+		for (const draft of drafts) {
+			expect(draft.title.length).toBeGreaterThan(0);
+			expect(draft.worker.length).toBeGreaterThan(0);
+			expect(draft.reason.length).toBeGreaterThan(0);
+			expect(draft.expectedOutput.length).toBeGreaterThan(0);
+		}
 	});
 });

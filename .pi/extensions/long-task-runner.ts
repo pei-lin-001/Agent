@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto";
 import type { ExtensionAPI, ExtensionCommandContext } from "@mariozechner/pi-coding-agent";
 import { StringEnum } from "@mariozechner/pi-ai";
 import { Type } from "typebox";
-import { recommendAgentDispatch } from "./multi-agent-dispatcher.js";
+import { buildAgentStepDrafts, recommendAgentDispatch } from "./multi-agent-dispatcher.js";
 
 type TaskStatus = "pending" | "running" | "blocked" | "completed" | "failed" | "cancelled";
 type StepStatus = "pending" | "running" | "completed" | "failed" | "skipped" | "blocked";
@@ -27,6 +27,8 @@ interface AddTaskStepOptions {
 	input?: string;
 	worker?: string;
 	modelPolicy?: string;
+	expectedOutput?: string;
+	allowedScope?: string[];
 }
 
 interface AddTaskStepResult {
@@ -45,6 +47,8 @@ export interface LongTaskStep {
 	input: string;
 	output?: string;
 	error?: string;
+	expectedOutput?: string;
+	allowedScope?: string[];
 	startedAt?: string;
 	completedAt?: string;
 }
@@ -84,12 +88,12 @@ const DEFAULT_CONFIG: Required<Pick<TaskRouterConfig, "enabled" | "defaultMode" 
 const VALID_TASK_STATUSES: TaskStatus[] = ["pending", "running", "blocked", "completed", "failed", "cancelled"];
 const VALID_STEP_STATUSES: StepStatus[] = ["pending", "running", "completed", "failed", "skipped", "blocked"];
 const LongTaskToolParams = Type.Object({
-	action: StringEnum(["create", "list", "show", "add_step", "set_task", "set_step", "add_artifact", "resume"] as const, {
+	action: StringEnum(["create", "list", "show", "add_step", "set_task", "set_step", "add_artifact", "resume", "suggest_steps", "add_suggested_steps"] as const, {
 		description: "Long task action to perform.",
 	}),
-	goal: Type.Optional(Type.String({ description: "Goal for create." })),
+	goal: Type.Optional(Type.String({ description: "Goal for create, suggest_steps, or add_suggested_steps." })),
 	taskId: Type.Optional(
-		Type.String({ description: "Task id for show, add_step, set_task, set_step, add_artifact, or resume." }),
+		Type.String({ description: "Task id for show, add_step, set_task, set_step, add_artifact, resume, or add_suggested_steps." }),
 	),
 	title: Type.Optional(Type.String({ description: "Step title for add_step." })),
 	stepId: Type.Optional(Type.String({ description: "Step id for set_step." })),
@@ -97,6 +101,8 @@ const LongTaskToolParams = Type.Object({
 	message: Type.Optional(Type.String({ description: "Optional output or error message for step updates." })),
 	worker: Type.Optional(Type.String({ description: "Optional worker hint for add_step, such as researcher or reviewer." })),
 	modelPolicy: Type.Optional(Type.String({ description: "Optional model policy hint for add_step." })),
+	expectedOutput: Type.Optional(Type.String({ description: "Optional expected output description for add_step." })),
+	allowedScope: Type.Optional(Type.Array(Type.String(), { description: "Optional allowed scope for add_step." })),
 	artifact: Type.Optional(Type.String({ description: "Artifact path, URL, or note for add_artifact." })),
 });
 
@@ -244,6 +250,8 @@ function addOrReuseTaskStep(cwd: string, taskId: string, title: string, options:
 		input: options.input?.trim() || cleanTitle,
 		worker: options.worker?.trim() || undefined,
 		modelPolicy: options.modelPolicy?.trim() || undefined,
+		expectedOutput: options.expectedOutput?.trim() || undefined,
+		allowedScope: options.allowedScope?.length ? options.allowedScope : undefined,
 	};
 	task.plan.push(step);
 	task.currentStepId = task.currentStepId ?? step.id;
@@ -504,6 +512,15 @@ function formatTaskDetails(task: LongTaskRecord): string {
 export function buildResumePrompt(task: LongTaskRecord): string {
 	const completedSteps = task.plan.filter((step) => step.status === "completed");
 	const nextStep = task.plan.find((step) => step.status === "pending" || step.status === "running");
+	function formatStepLine(step: LongTaskStep): string {
+		const meta = [
+			step.worker ? `worker: ${step.worker}` : undefined,
+			step.expectedOutput ? `expectedOutput: ${step.expectedOutput}` : undefined,
+			step.allowedScope?.length ? `allowedScope: ${step.allowedScope.join(", ")}` : undefined,
+		].filter((line): line is string => !!line);
+		const primary = `- ${step.id}: ${step.title}`;
+		return meta.length > 0 ? `${primary}\n  ${meta.join("\n  ")}` : primary;
+	}
 	return [
 		`继续长期任务：${task.title}`,
 		"",
@@ -514,10 +531,12 @@ export function buildResumePrompt(task: LongTaskRecord): string {
 		task.goal,
 		"",
 		completedSteps.length > 0
-			? `已完成步骤：\n${completedSteps.map((step) => `- ${step.id}: ${step.title}`).join("\n")}`
+			? `已完成步骤：\n${completedSteps.map(formatStepLine).join("\n")}`
 			: "已完成步骤：暂无",
 		"",
-		nextStep ? `下一步：${nextStep.id}: ${nextStep.title}` : "下一步：请先根据目标补充计划步骤。",
+		nextStep
+			? `下一步：${formatStepLine(nextStep)}`
+			: "下一步：请先根据目标补充计划步骤。",
 		task.artifacts.length > 0 ? `\n相关产物：\n${task.artifacts.map((artifact) => `- ${artifact}`).join("\n")}` : "",
 		"",
 		"请先简要复述当前进度，再继续推进下一步。",
@@ -532,6 +551,7 @@ export function buildTaskRoutingSystemPrompt(cwd: string, userPrompt: string): s
 	const keywords = config.routing?.autoEscalateKeywords ?? [];
 	const matchedKeywords = keywords.filter((keyword) => userPrompt.includes(keyword));
 	const recommendation = recommendAgentDispatch(userPrompt);
+	const stepDrafts = buildAgentStepDrafts(userPrompt);
 	const workerLines = Object.entries(config.workers ?? {})
 		.filter(([, worker]) => worker.enabled !== false)
 		.map(([name, worker]) => `- ${name}: permission=${worker.permission ?? "unspecified"}, modelPolicy=${worker.modelPolicy ?? "default"}`);
@@ -563,10 +583,24 @@ export function buildTaskRoutingSystemPrompt(cwd: string, userPrompt: string): s
 		`Dispatch recommended action: ${recommendation.action}`,
 		`Dispatch should create task: ${recommendation.shouldCreateTask}`,
 		`Dispatch should plan workers: ${recommendation.shouldPlanWorkers}`,
+		recommendation.workerPlanHints.length > 0
+			? [
+					"Dispatch worker plan hints:",
+					...recommendation.workerPlanHints.map((hint) => `- ${hint.role}: ${hint.reason}`),
+				].join("\n")
+			: "Dispatch worker plan hints: none",
+		stepDrafts.length > 0
+			? [
+					"Dispatch step drafts:",
+					...stepDrafts.map((draft) => `- [${draft.worker}] ${draft.title} -> ${draft.expectedOutput}`),
+				].join("\n")
+			: "Dispatch step drafts: none",
 		"Recommendation usage:",
 		"- answer_directly: answer without long_task unless the user explicitly asks to track it.",
 		"- use_long_task: use or create a long_task, reusing an active matching task first.",
 		"- plan_multi_agent: keep the lead agent in control; create or reuse a long_task and plan worker roles, but do not spawn workers yet.",
+		"Worker plan hints are planning guidance only; do not spawn workers unless a later implementation explicitly supports worker execution.",
+		"Step drafts are suggestions only; do not add them to long_task unless the user asks to track or continue the task.",
 		activeTaskLines.length > 0 ? `Active long tasks:\n${activeTaskLines.join("\n")}` : "Active long tasks: none.",
 		workerLines.length > 0 ? `Available worker hints:\n${workerLines.join("\n")}` : undefined,
 		modelPolicyLines.length > 0 ? `Available model policy hints:\n${modelPolicyLines.join("\n")}` : undefined,
@@ -603,7 +637,7 @@ function requireString(value: string | undefined, label: string): string {
 function executeLongTaskAction(
 	cwd: string,
 	params: {
-		action: "create" | "list" | "show" | "add_step" | "set_task" | "set_step" | "add_artifact" | "resume";
+		action: "create" | "list" | "show" | "add_step" | "set_task" | "set_step" | "add_artifact" | "resume" | "suggest_steps" | "add_suggested_steps";
 		goal?: string;
 		taskId?: string;
 		title?: string;
@@ -612,11 +646,46 @@ function executeLongTaskAction(
 		message?: string;
 		worker?: string;
 		modelPolicy?: string;
+		expectedOutput?: string;
+		allowedScope?: string[];
 		artifact?: string;
 	},
 ): { text: string; details: unknown } {
 	if (!isEnabled(cwd)) {
 		throw new Error("Long-task runner is disabled by .pi/task-router.config.json");
+	}
+	if (params.action === "suggest_steps") {
+		const goal = (params.goal ?? "").trim();
+		const drafts = buildAgentStepDrafts(goal);
+		if (drafts.length === 0) {
+			return { text: "No multi-agent step drafts suggested for this goal.", details: { drafts: [] } };
+		}
+		const lines = [
+			"Suggested steps:",
+			...drafts.map(
+				(draft) =>
+					`- [${draft.worker}] ${draft.title}\n  reason: ${draft.reason}\n  expectedOutput: ${draft.expectedOutput}`,
+			),
+		];
+		return { text: lines.join("\n"), details: { drafts } };
+	}
+	if (params.action === "add_suggested_steps") {
+		const task = readTask(cwd, requireString(params.taskId, "taskId"));
+		const goal = (params.goal || task.goal).trim();
+		const drafts = buildAgentStepDrafts(goal);
+		const results: Array<{ draft: typeof drafts[number]; stepId: string; reused: boolean }> = [];
+		for (const draft of drafts) {
+			const result = addOrReuseTaskStep(cwd, task.id, draft.title, {
+				input: draft.reason,
+				worker: draft.worker,
+				expectedOutput: draft.expectedOutput,
+			});
+			results.push({ draft, stepId: result.step.id, reused: result.reused });
+		}
+		const addedCount = results.filter((r) => !r.reused).length;
+		const reusedCount = results.filter((r) => r.reused).length;
+		const parts = [`Added ${addedCount} step(s) to task, reused ${reusedCount} existing step(s).`, formatTaskSummary(readTask(cwd, task.id))];
+		return { text: parts.join("\n"), details: { results } };
 	}
 	if (params.action === "create") {
 		const goal = requireString(params.goal, "goal");
@@ -645,6 +714,8 @@ function executeLongTaskAction(
 		const result = addOrReuseTaskStep(cwd, requireString(params.taskId, "taskId"), requireString(params.title, "title"), {
 			worker: params.worker,
 			modelPolicy: params.modelPolicy,
+			expectedOutput: params.expectedOutput,
+			allowedScope: params.allowedScope,
 		});
 		if (result.reused) {
 			return {
@@ -782,6 +853,8 @@ export default function longTaskRunnerExtension(pi: ExtensionAPI) {
 			"Before create or add_step, inspect active task state and reuse an existing matching task or step instead of duplicating it.",
 			"Use long_task with action create before tracking a new long-running task, then add_step and set_step as progress is made.",
 			"Use long_task add_artifact to attach important files, URLs, notes, or outputs to the task record.",
+			"Use long_task suggest_steps to preview step drafts for a goal without writing anything.",
+			"Use long_task add_suggested_steps to persist suggested step drafts into a task, reusing existing steps when they match.",
 		],
 		parameters: LongTaskToolParams,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {

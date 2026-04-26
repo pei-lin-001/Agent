@@ -15,7 +15,17 @@ import longTaskRunnerExtension, {
 type CommandHandler = (args: string, ctx: FakeCommandContext) => Promise<void>;
 type ExtensionHandler = (event: unknown, ctx: unknown) => Promise<unknown> | unknown;
 type LongTaskToolParams = {
-	action: "create" | "list" | "show" | "add_step" | "set_task" | "set_step" | "add_artifact" | "resume";
+	action:
+		| "create"
+		| "list"
+		| "show"
+		| "add_step"
+		| "set_task"
+		| "set_step"
+		| "add_artifact"
+		| "resume"
+		| "suggest_steps"
+		| "add_suggested_steps";
 	goal?: string;
 	taskId?: string;
 	title?: string;
@@ -24,6 +34,8 @@ type LongTaskToolParams = {
 	message?: string;
 	worker?: string;
 	modelPolicy?: string;
+	expectedOutput?: string;
+	allowedScope?: string[];
 	artifact?: string;
 };
 
@@ -187,6 +199,33 @@ describe("long task runner extension", () => {
 		expect(prompt).toContain("Dispatch should plan workers: true");
 		expect(prompt).toContain("Recommendation usage:");
 		expect(prompt).toContain("do not spawn workers yet");
+		expect(prompt).toContain("Dispatch worker plan hints:");
+		expect(prompt).toContain("- researcher:");
+		expect(prompt).toContain("- coder:");
+		expect(prompt).toContain("- tester:");
+		expect(prompt).toContain("- reviewer:");
+		expect(prompt).toContain(
+			"do not spawn workers unless a later implementation explicitly supports worker execution",
+		);
+	});
+
+	it("includes docWriter in worker plan when prompt mentions documentation", () => {
+		const cwd = createTempDir();
+		tempDirs.push(cwd);
+		mkdirSync(join(cwd, ".pi"), { recursive: true });
+		writeFileSync(
+			join(cwd, ".pi", "task-router.config.json"),
+			JSON.stringify({ enabled: true, defaultMode: "immediate" }),
+			"utf-8",
+		);
+
+		const prompt = buildTaskRoutingSystemPrompt(
+			cwd,
+			"我们要做多 agent 协作编排，包含调研、编码、测试、review，并更新 README 文档",
+		);
+
+		expect(prompt).toContain("Dispatch worker plan hints:");
+		expect(prompt).toContain("- docWriter:");
 	});
 
 	it("includes long_task classifier output in routing prompt when prompt triggers long-term work", () => {
@@ -209,6 +248,7 @@ describe("long task runner extension", () => {
 		expect(prompt).toContain("Dispatch should create task: true");
 		expect(prompt).toContain("Dispatch should plan workers: false");
 		expect(prompt).toContain("Recommendation usage:");
+		expect(prompt).toContain("Dispatch worker plan hints: none");
 	});
 
 	it("includes immediate classifier output in routing prompt when prompt triggers immediate mode", () => {
@@ -230,6 +270,7 @@ describe("long task runner extension", () => {
 		expect(prompt).toContain("Dispatch should create task: false");
 		expect(prompt).toContain("Dispatch should plan workers: false");
 		expect(prompt).toContain("Recommendation usage:");
+		expect(prompt).toContain("Dispatch worker plan hints: none");
 	});
 
 	it("registers the /task command and loads resume text into the editor", async () => {
@@ -314,5 +355,214 @@ describe("long task runner extension", () => {
 		);
 
 		expect(readTask(cwd, taskId!).artifacts).toContain(".pi/long-task-agent.md");
+	});
+
+	it("routing prompt contains Dispatch step drafts for multi-agent prompts", () => {
+		const cwd = createTempDir();
+		tempDirs.push(cwd);
+		mkdirSync(join(cwd, ".pi"), { recursive: true });
+		writeFileSync(
+			join(cwd, ".pi", "task-router.config.json"),
+			JSON.stringify({ enabled: true, defaultMode: "immediate" }),
+			"utf-8",
+		);
+
+		const prompt = buildTaskRoutingSystemPrompt(cwd, "我们要做多 agent 协作编排，包含调研、编码、测试和 review");
+
+		expect(prompt).toContain("Dispatch step drafts:");
+		expect(prompt).toContain("[researcher]");
+		expect(prompt).toContain("[coder]");
+		expect(prompt).toContain("[tester]");
+		expect(prompt).toContain("[reviewer]");
+		expect(prompt).toContain(
+			"Step drafts are suggestions only; do not add them to long_task unless the user asks to track or continue the task",
+		);
+	});
+
+	it("routing prompt contains Dispatch step drafts: none for immediate prompts", () => {
+		const cwd = createTempDir();
+		tempDirs.push(cwd);
+		mkdirSync(join(cwd, ".pi"), { recursive: true });
+		writeFileSync(
+			join(cwd, ".pi", "task-router.config.json"),
+			JSON.stringify({ enabled: true, defaultMode: "immediate" }),
+			"utf-8",
+		);
+
+		const prompt = buildTaskRoutingSystemPrompt(cwd, "帮我解释一下 mem0 是干什么的");
+
+		expect(prompt).toContain("Dispatch step drafts: none");
+	});
+
+	it("long_task suggest_steps returns drafts without creating a task", async () => {
+		const cwd = createTempDir();
+		tempDirs.push(cwd);
+		mkdirSync(join(cwd, ".pi"), { recursive: true });
+		writeFileSync(
+			join(cwd, ".pi", "task-router.config.json"),
+			JSON.stringify({ enabled: true, defaultMode: "immediate" }),
+			"utf-8",
+		);
+
+		const { tools } = createExtensionHarness();
+		const longTaskTool = tools.get("long_task");
+		expect(longTaskTool).toBeDefined();
+
+		const result = await longTaskTool!.execute(
+			"tool-call-1",
+			{ action: "suggest_steps", goal: "我们要做多 agent 协作编排，包含调研、编码、测试和 review" },
+			undefined,
+			undefined,
+			{ cwd },
+		);
+
+		expect(result.isError).toBeFalsy();
+		expect(result.content[0]!.text).toContain("Suggested steps:");
+		expect(result.content[0]!.text).toContain("[researcher]");
+		expect(result.content[0]!.text).toContain("[coder]");
+		expect(result.content[0]!.text).toContain("[tester]");
+		expect(result.content[0]!.text).toContain("[reviewer]");
+
+		const tasksDir = join(cwd, ".pi", "tasks");
+		expect(existsSync(tasksDir)).toBe(false);
+	});
+
+	it("long_task suggest_steps returns no drafts for non-multi-agent goals", async () => {
+		const cwd = createTempDir();
+		tempDirs.push(cwd);
+		mkdirSync(join(cwd, ".pi"), { recursive: true });
+		writeFileSync(
+			join(cwd, ".pi", "task-router.config.json"),
+			JSON.stringify({ enabled: true, defaultMode: "immediate" }),
+			"utf-8",
+		);
+
+		const { tools } = createExtensionHarness();
+		const longTaskTool = tools.get("long_task");
+		expect(longTaskTool).toBeDefined();
+
+		const result = await longTaskTool!.execute(
+			"tool-call-1",
+			{ action: "suggest_steps", goal: "帮我解释一下 mem0 是干什么的" },
+			undefined,
+			undefined,
+			{ cwd },
+		);
+
+		expect(result.isError).toBeFalsy();
+		expect(result.content[0]!.text).toContain("No multi-agent step drafts suggested");
+	});
+
+	it("long_task add_suggested_steps writes steps to an existing task", async () => {
+		const cwd = createTempDir();
+		tempDirs.push(cwd);
+		mkdirSync(join(cwd, ".pi"), { recursive: true });
+		writeFileSync(
+			join(cwd, ".pi", "task-router.config.json"),
+			JSON.stringify({ enabled: true, defaultMode: "immediate" }),
+			"utf-8",
+		);
+
+		const { tools } = createExtensionHarness();
+		const longTaskTool = tools.get("long_task");
+		expect(longTaskTool).toBeDefined();
+
+		const createResult = await longTaskTool!.execute(
+			"tool-call-1",
+			{ action: "create", goal: "我们要做多 agent 协作编排，包含调研、编码、测试和 review" },
+			undefined,
+			undefined,
+			{ cwd },
+		);
+		const taskId = createResult.content[0]!.text.match(/id: ([^\n]+)/)?.[1];
+		expect(taskId).toBeDefined();
+
+		const addResult = await longTaskTool!.execute(
+			"tool-call-2",
+			{ action: "add_suggested_steps", taskId },
+			undefined,
+			undefined,
+			{ cwd },
+		);
+
+		expect(addResult.isError).toBeFalsy();
+		expect(addResult.content[0]!.text).toContain("Added 4 step(s) to task");
+		expect(addResult.content[0]!.text).toContain("reused 0");
+
+		const task = readTask(cwd, taskId!);
+		expect(task.plan).toHaveLength(4);
+		expect(task.plan[0]!.worker).toBe("researcher");
+		expect(task.plan[0]!.expectedOutput).toBe("Concise findings, relevant files, risks, and assumptions.");
+	});
+
+	it("long_task add_suggested_steps reuses existing steps on second call", async () => {
+		const cwd = createTempDir();
+		tempDirs.push(cwd);
+		mkdirSync(join(cwd, ".pi"), { recursive: true });
+		writeFileSync(
+			join(cwd, ".pi", "task-router.config.json"),
+			JSON.stringify({ enabled: true, defaultMode: "immediate" }),
+			"utf-8",
+		);
+
+		const { tools } = createExtensionHarness();
+		const longTaskTool = tools.get("long_task");
+		expect(longTaskTool).toBeDefined();
+
+		const createResult = await longTaskTool!.execute(
+			"tool-call-1",
+			{ action: "create", goal: "我们要做多 agent 协作编排，包含调研、编码、测试和 review" },
+			undefined,
+			undefined,
+			{ cwd },
+		);
+		const taskId = createResult.content[0]!.text.match(/id: ([^\n]+)/)?.[1];
+		expect(taskId).toBeDefined();
+
+		await longTaskTool!.execute("tool-call-2", { action: "add_suggested_steps", taskId }, undefined, undefined, {
+			cwd,
+		});
+
+		const secondResult = await longTaskTool!.execute(
+			"tool-call-3",
+			{ action: "add_suggested_steps", taskId },
+			undefined,
+			undefined,
+			{ cwd },
+		);
+
+		expect(secondResult.content[0]!.text).toContain("Added 0 step(s)");
+		expect(secondResult.content[0]!.text).toContain("reused 4");
+
+		const task = readTask(cwd, taskId!);
+		expect(task.plan).toHaveLength(4);
+	});
+
+	it("resume prompt displays worker and expectedOutput metadata when present", () => {
+		const cwd = createTempDir();
+		tempDirs.push(cwd);
+		const task = createLongTask(
+			cwd,
+			"We need multi agent collaboration, covering research, coding, testing, and review",
+		);
+		const withFirstStep = addTaskStep(cwd, task.id, "Research context and constraints", {
+			worker: "researcher",
+			expectedOutput: "Concise findings, relevant files, risks, and assumptions.",
+		});
+		const stepId = withFirstStep.plan[0]!.id;
+		updateStepStatus(cwd, task.id, stepId, "completed");
+
+		addTaskStep(cwd, task.id, "Implement scoped changes", {
+			worker: "coder",
+			expectedOutput: "Changed files and implementation summary.",
+		});
+
+		const updated = readTask(cwd, task.id);
+		const prompt = buildResumePrompt(updated);
+
+		expect(prompt).toContain("worker: researcher");
+		expect(prompt).toContain("expectedOutput: Concise findings, relevant files, risks, and assumptions.");
+		expect(prompt).toContain("worker: coder");
+		expect(prompt).toContain("expectedOutput: Changed files and implementation summary.");
 	});
 });
