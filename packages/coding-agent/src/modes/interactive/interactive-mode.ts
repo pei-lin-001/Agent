@@ -194,6 +194,7 @@ const API_KEY_LOGIN_PROVIDERS: Record<string, string> = {
 	"minimax-cn": "MiniMax (China)",
 	opencode: "OpenCode Zen",
 	"opencode-go": "OpenCode Go",
+	"ollama-cloud": "Ollama Cloud",
 	openai: "OpenAI",
 	openrouter: "OpenRouter",
 	"vercel-ai-gateway": "Vercel AI Gateway",

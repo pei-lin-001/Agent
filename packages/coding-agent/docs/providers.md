@@ -56,6 +56,7 @@ pi
 | Anthropic | `ANTHROPIC_API_KEY` | `anthropic` |
 | Azure OpenAI Responses | `AZURE_OPENAI_API_KEY` | `azure-openai-responses` |
 | OpenAI | `OPENAI_API_KEY` | `openai` |
+| Ollama Cloud | `OLLAMA_API_KEY` | `ollama-cloud` |
 | DeepSeek | `DEEPSEEK_API_KEY` | `deepseek` |
 | Google Gemini | `GEMINI_API_KEY` | `google` |
 | Mistral | `MISTRAL_API_KEY` | `mistral` |
@@ -181,6 +182,17 @@ export GOOGLE_CLOUD_LOCATION=us-central1
 ```
 
 Or set `GOOGLE_APPLICATION_CREDENTIALS` to a service account key file.
+
+### Ollama Cloud
+
+Ollama Cloud uses Ollama's hosted API with OpenAI-compatible chat completions models.
+
+```bash
+export OLLAMA_API_KEY=...
+pi --provider ollama-cloud --model qwen3-coder-next
+```
+
+The built-in Ollama Cloud models use `https://ollama.com/v1` for OpenAI-compatible requests.
 
 ## Custom Providers
 

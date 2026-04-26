@@ -50,6 +50,7 @@ Unified LLM API with automatic model discovery, provider configuration, token an
 - **OpenAI**
 - **Azure OpenAI (Responses)**
 - **OpenAI Codex** (ChatGPT Plus/Pro subscription, requires OAuth, see below)
+- **Ollama Cloud**
 - **DeepSeek**
 - **Anthropic**
 - **Google**
@@ -1021,6 +1022,7 @@ In Node.js environments, you can set environment variables to avoid passing API 
 |----------|------------------------|
 | OpenAI | `OPENAI_API_KEY` |
 | Azure OpenAI | `AZURE_OPENAI_API_KEY` + `AZURE_OPENAI_BASE_URL` or `AZURE_OPENAI_RESOURCE_NAME` (optional `AZURE_OPENAI_API_VERSION`, `AZURE_OPENAI_DEPLOYMENT_NAME_MAP` like `model=deployment,model2=deployment2`) |
+| Ollama Cloud | `OLLAMA_API_KEY` |
 | Anthropic | `ANTHROPIC_API_KEY` or `ANTHROPIC_OAUTH_TOKEN` |
 | DeepSeek | `DEEPSEEK_API_KEY` |
 | Google | `GEMINI_API_KEY` |

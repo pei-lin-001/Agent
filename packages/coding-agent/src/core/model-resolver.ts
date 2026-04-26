@@ -17,6 +17,7 @@ export const defaultModelPerProvider: Record<KnownProvider, string> = {
 	openai: "gpt-5.4",
 	"azure-openai-responses": "gpt-5.4",
 	"openai-codex": "gpt-5.5",
+	"ollama-cloud": "qwen3-coder-next",
 	deepseek: "deepseek-v4-pro",
 	google: "gemini-3.1-pro-preview",
 	"google-gemini-cli": "gemini-3.1-pro-preview",

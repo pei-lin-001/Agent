@@ -65,12 +65,57 @@ const KIMI_STATIC_HEADERS = {
 
 const AI_GATEWAY_MODELS_URL = "https://ai-gateway.vercel.sh/v1";
 const AI_GATEWAY_BASE_URL = "https://ai-gateway.vercel.sh";
+const OLLAMA_CLOUD_API_URL = "https://ollama.com";
+const OLLAMA_CLOUD_OPENAI_BASE_URL = "https://ollama.com/v1";
 const ZAI_TOOL_STREAM_UNSUPPORTED_MODELS = new Set(["glm-4.5", "glm-4.5-air", "glm-4.5-flash", "glm-4.5v"]);
 const EAGER_TOOL_INPUT_STREAMING_UNSUPPORTED_ANTHROPIC_MODELS = new Set([
 	"github-copilot:claude-haiku-4.5",
 	"github-copilot:claude-sonnet-4",
 	"github-copilot:claude-sonnet-4.5",
 ]);
+
+const OLLAMA_CLOUD_STATIC_MODELS: Array<{
+	id: string;
+	contextWindow: number;
+	reasoning?: boolean;
+	input?: ("text" | "image")[];
+}> = [
+	{ id: "qwen3-coder-next", contextWindow: 262144 },
+	{ id: "qwen3-coder:480b", contextWindow: 262144 },
+	{ id: "qwen3.5:397b", contextWindow: 262144, reasoning: true, input: ["text", "image"] },
+	{ id: "qwen3-next:80b", contextWindow: 262144, reasoning: true },
+	{ id: "deepseek-v4-flash", contextWindow: 1048576, reasoning: true },
+	{ id: "deepseek-v3.2", contextWindow: 163840, reasoning: true },
+	{ id: "deepseek-v3.1:671b", contextWindow: 163840, reasoning: true },
+	{ id: "kimi-k2.6", contextWindow: 262144, reasoning: true, input: ["text", "image"] },
+	{ id: "kimi-k2.5", contextWindow: 262144, reasoning: true, input: ["text", "image"] },
+	{ id: "kimi-k2-thinking", contextWindow: 262144, reasoning: true },
+	{ id: "kimi-k2:1t", contextWindow: 262144 },
+	{ id: "minimax-m2.7", contextWindow: 196608, reasoning: true },
+	{ id: "minimax-m2.5", contextWindow: 204800, reasoning: true },
+	{ id: "minimax-m2.1", contextWindow: 204800, reasoning: true },
+	{ id: "minimax-m2", contextWindow: 204800 },
+	{ id: "glm-5.1", contextWindow: 202752, reasoning: true },
+	{ id: "glm-5", contextWindow: 202752, reasoning: true },
+	{ id: "glm-4.7", contextWindow: 202752, reasoning: true },
+	{ id: "glm-4.6", contextWindow: 202752, reasoning: true },
+	{ id: "gpt-oss:120b", contextWindow: 131072, reasoning: true },
+	{ id: "gpt-oss:20b", contextWindow: 131072, reasoning: true },
+	{ id: "gemini-3-flash-preview", contextWindow: 1048576, reasoning: true, input: ["text", "image"] },
+	{ id: "gemma4:31b", contextWindow: 262144, reasoning: true, input: ["text", "image"] },
+	{ id: "qwen3-vl:235b", contextWindow: 262144, reasoning: true, input: ["text", "image"] },
+	{ id: "qwen3-vl:235b-instruct", contextWindow: 262144, input: ["text", "image"] },
+	{ id: "mistral-large-3:675b", contextWindow: 262144, input: ["text", "image"] },
+	{ id: "ministral-3:14b", contextWindow: 262144, input: ["text", "image"] },
+	{ id: "ministral-3:8b", contextWindow: 262144, input: ["text", "image"] },
+	{ id: "ministral-3:3b", contextWindow: 262144, input: ["text", "image"] },
+	{ id: "devstral-2:123b", contextWindow: 262144 },
+	{ id: "devstral-small-2:24b", contextWindow: 262144, input: ["text", "image"] },
+	{ id: "nemotron-3-super", contextWindow: 262144, reasoning: true },
+	{ id: "nemotron-3-nano:30b", contextWindow: 262144, reasoning: true },
+	{ id: "cogito-2.1:671b", contextWindow: 163840, reasoning: true },
+	{ id: "rnj-1:8b", contextWindow: 32768 },
+];
 
 function getAnthropicMessagesCompat(provider: string, modelId: string): AnthropicMessagesCompat | undefined {
 	return EAGER_TOOL_INPUT_STREAMING_UNSUPPORTED_ANTHROPIC_MODELS.has(`${provider}:${modelId}`)
@@ -197,6 +242,97 @@ async function fetchAiGatewayModels(): Promise<Model<any>[]> {
 	} catch (error) {
 		console.error("Failed to fetch Vercel AI Gateway models:", error);
 		return [];
+	}
+}
+
+function toOllamaCloudModel(
+	id: string,
+	contextWindow: number,
+	reasoning: boolean,
+	input: ("text" | "image")[] = ["text"],
+): Model<"openai-completions"> {
+	return {
+		id,
+		name: id,
+		api: "openai-completions",
+		baseUrl: OLLAMA_CLOUD_OPENAI_BASE_URL,
+		provider: "ollama-cloud",
+		reasoning,
+		input,
+		cost: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+		},
+		compat: {
+			supportsDeveloperRole: false,
+			supportsReasoningEffort: false,
+		},
+		contextWindow,
+		maxTokens: 8192,
+	};
+}
+
+async function fetchOllamaCloudModels(): Promise<Model<any>[]> {
+	const fallbackModels = OLLAMA_CLOUD_STATIC_MODELS.map((model) =>
+		toOllamaCloudModel(model.id, model.contextWindow, model.reasoning === true, model.input),
+	);
+	const apiKey = process.env.OLLAMA_API_KEY;
+	if (!apiKey) {
+		console.log(`Using ${fallbackModels.length} static Ollama Cloud models (OLLAMA_API_KEY not set)`);
+		return fallbackModels;
+	}
+
+	try {
+		console.log("Fetching models from Ollama Cloud API...");
+		const tagsResponse = await fetch(`${OLLAMA_CLOUD_API_URL}/api/tags`, {
+			headers: { Authorization: `Bearer ${apiKey}` },
+		});
+		if (!tagsResponse.ok) {
+			throw new Error(`Ollama Cloud tags request failed with HTTP ${tagsResponse.status}`);
+		}
+		const tagsData = await tagsResponse.json();
+		const modelNames = Array.isArray(tagsData.models)
+			? tagsData.models.map((model: { name?: unknown }) => model.name).filter((name): name is string => typeof name === "string")
+			: [];
+
+		const models: Model<any>[] = [];
+		for (const modelName of modelNames) {
+			const showResponse = await fetch(`${OLLAMA_CLOUD_API_URL}/api/show`, {
+				method: "POST",
+				headers: {
+					Authorization: `Bearer ${apiKey}`,
+					"Content-Type": "application/json",
+				},
+				body: JSON.stringify({ model: modelName }),
+			});
+			if (!showResponse.ok) continue;
+
+			const showData = await showResponse.json();
+			const capabilities = Array.isArray(showData.capabilities) ? showData.capabilities : [];
+			if (!capabilities.includes("tools")) continue;
+
+			const modelInfo = showData.model_info && typeof showData.model_info === "object" ? showData.model_info : {};
+			const contextWindow =
+				Object.entries(modelInfo).find(([key]) => key.endsWith("context_length"))?.[1] ?? 4096;
+			const input: ("text" | "image")[] = capabilities.includes("vision") ? ["text", "image"] : ["text"];
+
+			models.push(
+				toOllamaCloudModel(
+					modelName,
+					typeof contextWindow === "number" ? contextWindow : Number(contextWindow) || 4096,
+					capabilities.includes("thinking"),
+					input,
+				),
+			);
+		}
+
+		console.log(`Fetched ${models.length} tool-capable models from Ollama Cloud`);
+		return models.length > 0 ? models : fallbackModels;
+	} catch (error) {
+		console.error("Failed to fetch Ollama Cloud models:", error);
+		return fallbackModels;
 	}
 }
 
@@ -721,9 +857,10 @@ async function generateModels() {
 	const modelsDevModels = await loadModelsDevData();
 	const openRouterModels = await fetchOpenRouterModels();
 	const aiGatewayModels = await fetchAiGatewayModels();
+	const ollamaCloudModels = await fetchOllamaCloudModels();
 
 	// Combine models (models.dev has priority)
-	const allModels = [...modelsDevModels, ...openRouterModels, ...aiGatewayModels].filter(
+	const allModels = [...modelsDevModels, ...openRouterModels, ...aiGatewayModels, ...ollamaCloudModels].filter(
 		(model) =>
 			!((model.provider === "opencode" || model.provider === "opencode-go") && model.id === "gpt-5.3-codex-spark"),
 	);

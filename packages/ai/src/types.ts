@@ -26,6 +26,7 @@ export type KnownProvider =
 	| "openai"
 	| "azure-openai-responses"
 	| "openai-codex"
+	| "ollama-cloud"
 	| "deepseek"
 	| "github-copilot"
 	| "xai"

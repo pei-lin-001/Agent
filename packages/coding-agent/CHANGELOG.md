@@ -4,6 +4,7 @@
 
 ### Added
 
+- Added Ollama Cloud to built-in provider setup, default model resolution, `/login`, and provider documentation.
 - Added `ctx.ui.setWorkingVisible()` so extensions can hide the built-in interactive working loader row without reserving layout space, plus a border-status editor example that moves working state into a custom editor border ([#3674](https://github.com/badlogic/pi-mono/issues/3674))
 
 ### Fixed

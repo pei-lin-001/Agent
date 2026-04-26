@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added Ollama Cloud as a built-in OpenAI-compatible provider with `OLLAMA_API_KEY` authentication.
+
 ### Changed
 
 - Changed OpenAI Codex Responses default text verbosity to `low` when no verbosity is specified.
