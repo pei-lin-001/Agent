@@ -182,6 +182,9 @@ describe("long task runner extension", () => {
 		expect(prompt).toContain("Dispatch classifier reason:");
 		expect(prompt).toContain("Dispatch classifier signals:");
 		expect(prompt).toContain("multi_agent_keyword");
+		expect(prompt).toContain("Dispatch recommended action: plan_multi_agent");
+		expect(prompt).toContain("Dispatch should create task: true");
+		expect(prompt).toContain("Dispatch should plan workers: true");
 	});
 
 	it("includes long_task classifier output in routing prompt when prompt triggers long-term work", () => {
@@ -200,6 +203,9 @@ describe("long task runner extension", () => {
 		expect(prompt).toContain("Dispatch classifier reason:");
 		expect(prompt).toContain("Dispatch classifier signals:");
 		expect(prompt).toContain("long_task_keyword_cn");
+		expect(prompt).toContain("Dispatch recommended action: use_long_task");
+		expect(prompt).toContain("Dispatch should create task: true");
+		expect(prompt).toContain("Dispatch should plan workers: false");
 	});
 
 	it("includes immediate classifier output in routing prompt when prompt triggers immediate mode", () => {
@@ -217,6 +223,9 @@ describe("long task runner extension", () => {
 		expect(prompt).toContain("Dispatch classifier mode: immediate");
 		expect(prompt).toContain("Dispatch classifier reason:");
 		expect(prompt).toContain("Dispatch classifier signals:");
+		expect(prompt).toContain("Dispatch recommended action: answer_directly");
+		expect(prompt).toContain("Dispatch should create task: false");
+		expect(prompt).toContain("Dispatch should plan workers: false");
 	});
 
 	it("registers the /task command and loads resume text into the editor", async () => {
