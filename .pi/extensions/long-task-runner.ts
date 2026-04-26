@@ -1,0 +1,606 @@
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { basename, join } from "node:path";
+import { randomUUID } from "node:crypto";
+import type { ExtensionAPI, ExtensionCommandContext } from "@mariozechner/pi-coding-agent";
+import { StringEnum } from "@mariozechner/pi-ai";
+import { Type } from "typebox";
+
+type TaskStatus = "pending" | "running" | "blocked" | "completed" | "failed" | "cancelled";
+type StepStatus = "pending" | "running" | "completed" | "failed" | "skipped" | "blocked";
+
+interface TaskRouterConfig {
+	enabled?: boolean;
+	defaultMode?: "immediate" | "long-task";
+	askWhenAmbiguous?: boolean;
+	longTaskStorageDir?: string;
+	routing?: {
+		autoEscalateKeywords?: string[];
+		autoEscalateWhenMultiplePhases?: boolean;
+		autoEscalateWhenManyFilesLikely?: boolean;
+	};
+	modelPolicies?: Record<string, { provider?: string | null; model?: string | null; thinkingLevel?: string | null }>;
+	workers?: Record<string, { enabled?: boolean; permission?: string; modelPolicy?: string; allowParallel?: boolean }>;
+}
+
+interface AddTaskStepOptions {
+	input?: string;
+	worker?: string;
+	modelPolicy?: string;
+}
+
+export interface LongTaskStep {
+	id: string;
+	title: string;
+	status: StepStatus;
+	dependsOn: string[];
+	worker?: string;
+	modelPolicy?: string;
+	input: string;
+	output?: string;
+	error?: string;
+	startedAt?: string;
+	completedAt?: string;
+}
+
+export interface LongTaskRecord {
+	id: string;
+	title: string;
+	status: TaskStatus;
+	createdAt: string;
+	updatedAt: string;
+	mode: "long-task";
+	goal: string;
+	plan: LongTaskStep[];
+	currentStepId?: string;
+	artifacts: string[];
+	memoryKeys: string[];
+	trace: LongTaskTraceEntry[];
+}
+
+interface LongTaskTraceEntry {
+	timestamp: string;
+	event: string;
+	message: string;
+}
+
+interface ParsedTaskCommand {
+	action: string;
+	args: string[];
+}
+
+const DEFAULT_STORAGE_DIR = ".pi/tasks";
+const DEFAULT_CONFIG: Required<Pick<TaskRouterConfig, "enabled" | "defaultMode" | "askWhenAmbiguous">> = {
+	enabled: true,
+	defaultMode: "immediate",
+	askWhenAmbiguous: true,
+};
+const VALID_TASK_STATUSES: TaskStatus[] = ["pending", "running", "blocked", "completed", "failed", "cancelled"];
+const VALID_STEP_STATUSES: StepStatus[] = ["pending", "running", "completed", "failed", "skipped", "blocked"];
+const LongTaskToolParams = Type.Object({
+	action: StringEnum(["create", "list", "show", "add_step", "set_task", "set_step", "add_artifact", "resume"] as const, {
+		description: "Long task action to perform.",
+	}),
+	goal: Type.Optional(Type.String({ description: "Goal for create." })),
+	taskId: Type.Optional(
+		Type.String({ description: "Task id for show, add_step, set_task, set_step, add_artifact, or resume." }),
+	),
+	title: Type.Optional(Type.String({ description: "Step title for add_step." })),
+	stepId: Type.Optional(Type.String({ description: "Step id for set_step." })),
+	status: Type.Optional(Type.String({ description: "Task or step status." })),
+	message: Type.Optional(Type.String({ description: "Optional output or error message for step updates." })),
+	worker: Type.Optional(Type.String({ description: "Optional worker hint for add_step, such as researcher or reviewer." })),
+	modelPolicy: Type.Optional(Type.String({ description: "Optional model policy hint for add_step." })),
+	artifact: Type.Optional(Type.String({ description: "Artifact path, URL, or note for add_artifact." })),
+});
+
+function nowIso(): string {
+	return new Date().toISOString();
+}
+
+function slugifyTitle(title: string): string {
+	const normalized = title
+		.toLowerCase()
+		.replace(/[^a-z0-9\u4e00-\u9fa5]+/g, "-")
+		.replace(/^-+|-+$/g, "")
+		.slice(0, 48);
+	return normalized || "task";
+}
+
+function createTaskId(title: string): string {
+	return `${new Date().toISOString().slice(0, 10)}-${slugifyTitle(title)}-${randomUUID().slice(0, 8)}`;
+}
+
+function createStepId(index: number, title: string): string {
+	return `step-${String(index + 1).padStart(2, "0")}-${slugifyTitle(title).slice(0, 32)}`;
+}
+
+function parseConfig(cwd: string): TaskRouterConfig {
+	const configPath = join(cwd, ".pi", "task-router.config.json");
+	if (!existsSync(configPath)) {
+		return {};
+	}
+	try {
+		return JSON.parse(readFileSync(configPath, "utf-8")) as TaskRouterConfig;
+	} catch (error) {
+		throw new Error(`Failed to parse task router config at ${configPath}: ${error instanceof Error ? error.message : String(error)}`);
+	}
+}
+
+function readConfig(cwd: string): TaskRouterConfig {
+	return { ...DEFAULT_CONFIG, ...parseConfig(cwd) };
+}
+
+function isEnabled(cwd: string): boolean {
+	return readConfig(cwd).enabled !== false;
+}
+
+export function getTaskStorageDir(cwd: string): string {
+	const config = readConfig(cwd);
+	return join(cwd, config.longTaskStorageDir ?? DEFAULT_STORAGE_DIR);
+}
+
+function ensureStorageDir(cwd: string): string {
+	const storageDir = getTaskStorageDir(cwd);
+	mkdirSync(storageDir, { recursive: true });
+	return storageDir;
+}
+
+function taskFilePath(cwd: string, taskId: string): string {
+	if (taskId.includes("/") || taskId.includes("\\") || taskId !== basename(taskId)) {
+		throw new Error(`Invalid task id: ${taskId}`);
+	}
+	return join(getTaskStorageDir(cwd), `${taskId}.json`);
+}
+
+function writeTask(cwd: string, task: LongTaskRecord): void {
+	ensureStorageDir(cwd);
+	writeFileSync(taskFilePath(cwd, task.id), `${JSON.stringify(task, null, 2)}\n`, "utf-8");
+}
+
+export function readTask(cwd: string, taskId: string): LongTaskRecord {
+	const path = taskFilePath(cwd, taskId);
+	if (!existsSync(path)) {
+		throw new Error(`Task not found: ${taskId}`);
+	}
+	return JSON.parse(readFileSync(path, "utf-8")) as LongTaskRecord;
+}
+
+export function listTasks(cwd: string): LongTaskRecord[] {
+	const storageDir = getTaskStorageDir(cwd);
+	if (!existsSync(storageDir)) {
+		return [];
+	}
+	return readdirSync(storageDir)
+		.filter((entry) => entry.endsWith(".json"))
+		.map((entry) => readTask(cwd, entry.slice(0, -".json".length)))
+		.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+}
+
+function appendTrace(task: LongTaskRecord, event: string, message: string): void {
+	task.trace.push({ timestamp: nowIso(), event, message });
+	task.updatedAt = nowIso();
+}
+
+function firstSentence(text: string): string {
+	const normalized = text.trim().replace(/\s+/g, " ");
+	if (normalized.length <= 80) {
+		return normalized;
+	}
+	return `${normalized.slice(0, 77)}...`;
+}
+
+export function createLongTask(cwd: string, goal: string, title?: string): LongTaskRecord {
+	const cleanGoal = goal.trim();
+	if (!cleanGoal) {
+		throw new Error("Task goal is required");
+	}
+	const taskTitle = title?.trim() || firstSentence(cleanGoal);
+	const timestamp = nowIso();
+	const task: LongTaskRecord = {
+		id: createTaskId(taskTitle),
+		title: taskTitle,
+		status: "pending",
+		createdAt: timestamp,
+		updatedAt: timestamp,
+		mode: "long-task",
+		goal: cleanGoal,
+		plan: [],
+		artifacts: [],
+		memoryKeys: [`task:${taskTitle}`],
+		trace: [{ timestamp, event: "task_created", message: "Task record created" }],
+	};
+	writeTask(cwd, task);
+	return task;
+}
+
+export function addTaskStep(cwd: string, taskId: string, title: string, options: AddTaskStepOptions = {}): LongTaskRecord {
+	const cleanTitle = title.trim();
+	if (!cleanTitle) {
+		throw new Error("Step title is required");
+	}
+	const task = readTask(cwd, taskId);
+	const step: LongTaskStep = {
+		id: createStepId(task.plan.length, cleanTitle),
+		title: cleanTitle,
+		status: "pending",
+		dependsOn: task.plan.length > 0 ? [task.plan[task.plan.length - 1]!.id] : [],
+		input: options.input?.trim() || cleanTitle,
+		worker: options.worker?.trim() || undefined,
+		modelPolicy: options.modelPolicy?.trim() || undefined,
+	};
+	task.plan.push(step);
+	task.currentStepId = task.currentStepId ?? step.id;
+	appendTrace(task, "step_added", `Added step ${step.id}`);
+	writeTask(cwd, task);
+	return task;
+}
+
+export function addTaskArtifact(cwd: string, taskId: string, artifact: string): LongTaskRecord {
+	const cleanArtifact = artifact.trim();
+	if (!cleanArtifact) {
+		throw new Error("Artifact is required");
+	}
+	const task = readTask(cwd, taskId);
+	task.artifacts.push(cleanArtifact);
+	appendTrace(task, "artifact_added", `Added artifact ${cleanArtifact}`);
+	writeTask(cwd, task);
+	return task;
+}
+
+export function updateTaskStatus(cwd: string, taskId: string, status: TaskStatus): LongTaskRecord {
+	if (!VALID_TASK_STATUSES.includes(status)) {
+		throw new Error(`Invalid task status: ${status}`);
+	}
+	const task = readTask(cwd, taskId);
+	task.status = status;
+	appendTrace(task, "task_status_updated", `Task status changed to ${status}`);
+	writeTask(cwd, task);
+	return task;
+}
+
+export function updateStepStatus(
+	cwd: string,
+	taskId: string,
+	stepId: string,
+	status: StepStatus,
+	message?: string,
+): LongTaskRecord {
+	if (!VALID_STEP_STATUSES.includes(status)) {
+		throw new Error(`Invalid step status: ${status}`);
+	}
+	const task = readTask(cwd, taskId);
+	const step = task.plan.find((candidate) => candidate.id === stepId);
+	if (!step) {
+		throw new Error(`Step not found: ${stepId}`);
+	}
+	step.status = status;
+	if (status === "running") {
+		step.startedAt = step.startedAt ?? nowIso();
+	}
+	if (status === "completed" || status === "failed" || status === "skipped" || status === "blocked") {
+		step.completedAt = nowIso();
+	}
+	if (status === "completed" && message?.trim()) {
+		step.output = message.trim();
+	}
+	if (status === "failed" && message?.trim()) {
+		step.error = message.trim();
+	}
+	task.currentStepId = task.plan.find((candidate) => candidate.status === "pending" || candidate.status === "running")?.id;
+	if (task.plan.length > 0 && task.plan.every((candidate) => candidate.status === "completed" || candidate.status === "skipped")) {
+		task.status = "completed";
+	}
+	appendTrace(task, "step_status_updated", `Step ${step.id} changed to ${status}`);
+	writeTask(cwd, task);
+	return task;
+}
+
+function parseTaskCommand(args: string): ParsedTaskCommand {
+	const parts = args.trim().split(/\s+/).filter(Boolean);
+	return { action: parts[0] ?? "help", args: parts.slice(1) };
+}
+
+function formatTaskSummary(task: LongTaskRecord): string {
+	const nextStep = task.plan.find((step) => step.status === "pending" || step.status === "running");
+	return [
+		`${task.title}`,
+		`id: ${task.id}`,
+		`status: ${task.status}`,
+		`steps: ${task.plan.filter((step) => step.status === "completed").length}/${task.plan.length}`,
+		nextStep ? `next: ${nextStep.id} ${nextStep.title}` : undefined,
+	].filter((line): line is string => !!line).join("\n");
+}
+
+function formatTaskDetails(task: LongTaskRecord): string {
+	const steps = task.plan.length === 0
+		? "No steps yet."
+		: task.plan
+			.map((step) => {
+				const hints = [step.worker ? `worker:${step.worker}` : undefined, step.modelPolicy ? `model:${step.modelPolicy}` : undefined]
+					.filter((hint): hint is string => !!hint)
+					.join(" ");
+				return `- ${step.id} [${step.status}] ${step.title}${hints ? ` (${hints})` : ""}`;
+			})
+			.join("\n");
+	const artifacts = task.artifacts.length === 0 ? "No artifacts yet." : task.artifacts.map((artifact) => `- ${artifact}`).join("\n");
+	return [
+		`# ${task.title}`,
+		`id: ${task.id}`,
+		`status: ${task.status}`,
+		"",
+		"Goal:",
+		task.goal,
+		"",
+		"Steps:",
+		steps,
+		"",
+		"Artifacts:",
+		artifacts,
+	].join("\n");
+}
+
+export function buildResumePrompt(task: LongTaskRecord): string {
+	const completedSteps = task.plan.filter((step) => step.status === "completed");
+	const nextStep = task.plan.find((step) => step.status === "pending" || step.status === "running");
+	return [
+		`继续长期任务：${task.title}`,
+		"",
+		`任务 ID：${task.id}`,
+		`当前状态：${task.status}`,
+		"",
+		"原始目标：",
+		task.goal,
+		"",
+		completedSteps.length > 0
+			? `已完成步骤：\n${completedSteps.map((step) => `- ${step.id}: ${step.title}`).join("\n")}`
+			: "已完成步骤：暂无",
+		"",
+		nextStep ? `下一步：${nextStep.id}: ${nextStep.title}` : "下一步：请先根据目标补充计划步骤。",
+		task.artifacts.length > 0 ? `\n相关产物：\n${task.artifacts.map((artifact) => `- ${artifact}`).join("\n")}` : "",
+		"",
+		"请先简要复述当前进度，再继续推进下一步。",
+	].join("\n");
+}
+
+export function buildTaskRoutingSystemPrompt(cwd: string, userPrompt: string): string | undefined {
+	const config = readConfig(cwd);
+	if (config.enabled === false) {
+		return undefined;
+	}
+	const keywords = config.routing?.autoEscalateKeywords ?? [];
+	const matchedKeywords = keywords.filter((keyword) => userPrompt.includes(keyword));
+	const workerLines = Object.entries(config.workers ?? {})
+		.filter(([, worker]) => worker.enabled !== false)
+		.map(([name, worker]) => `- ${name}: permission=${worker.permission ?? "unspecified"}, modelPolicy=${worker.modelPolicy ?? "default"}`);
+	const modelPolicyLines = Object.entries(config.modelPolicies ?? {})
+		.map(([name, policy]) => {
+			const model = policy.provider && policy.model ? `${policy.provider}/${policy.model}` : "current/default model";
+			return `- ${name}: ${model}${policy.thinkingLevel ? `, thinking=${policy.thinkingLevel}` : ""}`;
+		});
+	return [
+		"",
+		"# Personal Task Routing",
+		`Default mode: ${config.defaultMode ?? "immediate"}.`,
+		"Keep simple requests in immediate mode. Do not create long-task records for direct questions, small edits, or one-off commands.",
+		"Use the long_task tool only when work is complex, multi-step, interruptible, long-running, or explicitly asks for tracked/background progress.",
+		config.askWhenAmbiguous !== false
+			? "If a request is ambiguous and tracking would add overhead, ask the user before creating a long task."
+			: "When ambiguous, use your best judgment without asking.",
+		matchedKeywords.length > 0 ? `Current request matched long-task keyword(s): ${matchedKeywords.join(", ")}.` : undefined,
+		workerLines.length > 0 ? `Available worker hints:\n${workerLines.join("\n")}` : undefined,
+		modelPolicyLines.length > 0 ? `Available model policy hints:\n${modelPolicyLines.join("\n")}` : undefined,
+	].filter((line): line is string => !!line).join("\n");
+}
+
+function notify(ctx: ExtensionCommandContext, message: string, type: "info" | "warning" | "error" = "info"): void {
+	if (ctx.hasUI) {
+		ctx.ui.notify(message, type);
+	}
+}
+
+function helpText(): string {
+	return [
+		"Usage:",
+		"/task create <goal>",
+		"/task list",
+		"/task show <taskId>",
+		"/task add-step <taskId> <title>",
+		"/task add-artifact <taskId> <artifact>",
+		"/task set-task <taskId> <pending|running|blocked|completed|failed|cancelled>",
+		"/task set-step <taskId> <stepId> <pending|running|completed|failed|skipped|blocked> [message]",
+		"/task resume <taskId>",
+	].join("\n");
+}
+
+function requireString(value: string | undefined, label: string): string {
+	if (!value?.trim()) {
+		throw new Error(`${label} is required`);
+	}
+	return value.trim();
+}
+
+function executeLongTaskAction(
+	cwd: string,
+	params: {
+		action: "create" | "list" | "show" | "add_step" | "set_task" | "set_step" | "add_artifact" | "resume";
+		goal?: string;
+		taskId?: string;
+		title?: string;
+		stepId?: string;
+		status?: string;
+		message?: string;
+		worker?: string;
+		modelPolicy?: string;
+		artifact?: string;
+	},
+): { text: string; details: unknown } {
+	if (!isEnabled(cwd)) {
+		throw new Error("Long-task runner is disabled by .pi/task-router.config.json");
+	}
+	if (params.action === "create") {
+		const task = createLongTask(cwd, requireString(params.goal, "goal"));
+		return { text: `Created long task\n${formatTaskSummary(task)}`, details: task };
+	}
+	if (params.action === "list") {
+		const tasks = listTasks(cwd);
+		return {
+			text: tasks.length === 0 ? "No long tasks found." : tasks.map(formatTaskSummary).join("\n\n"),
+			details: { tasks },
+		};
+	}
+	if (params.action === "show") {
+		const task = readTask(cwd, requireString(params.taskId, "taskId"));
+		return { text: formatTaskDetails(task), details: task };
+	}
+	if (params.action === "add_step") {
+		const task = addTaskStep(cwd, requireString(params.taskId, "taskId"), requireString(params.title, "title"), {
+			worker: params.worker,
+			modelPolicy: params.modelPolicy,
+		});
+		return { text: `Added step\n${formatTaskSummary(task)}`, details: task };
+	}
+	if (params.action === "set_task") {
+		const task = updateTaskStatus(
+			cwd,
+			requireString(params.taskId, "taskId"),
+			requireString(params.status, "status") as TaskStatus,
+		);
+		return { text: `Updated task\n${formatTaskSummary(task)}`, details: task };
+	}
+	if (params.action === "set_step") {
+		const task = updateStepStatus(
+			cwd,
+			requireString(params.taskId, "taskId"),
+			requireString(params.stepId, "stepId"),
+			requireString(params.status, "status") as StepStatus,
+			params.message,
+		);
+		return { text: `Updated step\n${formatTaskSummary(task)}`, details: task };
+	}
+	if (params.action === "add_artifact") {
+		const task = addTaskArtifact(cwd, requireString(params.taskId, "taskId"), requireString(params.artifact, "artifact"));
+		return { text: `Added artifact\n${formatTaskSummary(task)}`, details: task };
+	}
+	const task = readTask(cwd, requireString(params.taskId, "taskId"));
+	return { text: buildResumePrompt(task), details: { task, resumePrompt: buildResumePrompt(task) } };
+}
+
+async function handleTaskCommand(args: string, ctx: ExtensionCommandContext): Promise<void> {
+	const parsed = parseTaskCommand(args);
+	try {
+		if (!isEnabled(ctx.cwd)) {
+			throw new Error("Long-task runner is disabled by .pi/task-router.config.json");
+		}
+		if (parsed.action === "create") {
+			const task = createLongTask(ctx.cwd, parsed.args.join(" "));
+			notify(ctx, `Created long task\n${formatTaskSummary(task)}`);
+			return;
+		}
+		if (parsed.action === "list") {
+			const tasks = listTasks(ctx.cwd);
+			notify(ctx, tasks.length === 0 ? "No long tasks found." : tasks.map(formatTaskSummary).join("\n\n"));
+			return;
+		}
+		if (parsed.action === "show") {
+			const taskId = parsed.args[0];
+			if (!taskId) throw new Error("Task id is required");
+			notify(ctx, formatTaskDetails(readTask(ctx.cwd, taskId)));
+			return;
+		}
+		if (parsed.action === "add-step") {
+			const [taskId, ...titleParts] = parsed.args;
+			if (!taskId) throw new Error("Task id is required");
+			const task = addTaskStep(ctx.cwd, taskId, titleParts.join(" "));
+			notify(ctx, `Added step\n${formatTaskSummary(task)}`);
+			return;
+		}
+		if (parsed.action === "add-artifact") {
+			const [taskId, ...artifactParts] = parsed.args;
+			if (!taskId) throw new Error("Task id is required");
+			const task = addTaskArtifact(ctx.cwd, taskId, artifactParts.join(" "));
+			notify(ctx, `Added artifact\n${formatTaskSummary(task)}`);
+			return;
+		}
+		if (parsed.action === "set-task") {
+			const [taskId, status] = parsed.args;
+			if (!taskId) throw new Error("Task id is required");
+			if (!status) throw new Error("Task status is required");
+			const task = updateTaskStatus(ctx.cwd, taskId, status as TaskStatus);
+			notify(ctx, `Updated task\n${formatTaskSummary(task)}`);
+			return;
+		}
+		if (parsed.action === "set-step") {
+			const [taskId, stepId, status, ...messageParts] = parsed.args;
+			if (!taskId) throw new Error("Task id is required");
+			if (!stepId) throw new Error("Step id is required");
+			if (!status) throw new Error("Step status is required");
+			const task = updateStepStatus(ctx.cwd, taskId, stepId, status as StepStatus, messageParts.join(" "));
+			notify(ctx, `Updated step\n${formatTaskSummary(task)}`);
+			return;
+		}
+		if (parsed.action === "resume") {
+			const taskId = parsed.args[0];
+			if (!taskId) throw new Error("Task id is required");
+			const prompt = buildResumePrompt(readTask(ctx.cwd, taskId));
+			if (ctx.hasUI) {
+				ctx.ui.setEditorText(prompt);
+				notify(ctx, `Loaded resume prompt for ${taskId}`);
+			}
+			return;
+		}
+		notify(ctx, helpText(), "info");
+	} catch (error) {
+		notify(ctx, error instanceof Error ? error.message : String(error), "error");
+	}
+}
+
+export default function longTaskRunnerExtension(pi: ExtensionAPI) {
+	pi.on("before_agent_start", async (event, ctx) => {
+		const routingPrompt = buildTaskRoutingSystemPrompt(ctx.cwd, event.prompt);
+		if (!routingPrompt) {
+			return undefined;
+		}
+		return {
+			systemPrompt: `${event.systemPrompt}${routingPrompt}`,
+		};
+	});
+
+	pi.registerTool({
+		name: "long_task",
+		label: "Long Task",
+		description: "Create, inspect, update, and resume durable local long-task records.",
+		promptSnippet: "Track complex, multi-step, interruptible work as durable local task records",
+		promptGuidelines: [
+			"Use long_task only for complex, multi-step, long-running, interruptible, or explicitly requested tracked work.",
+			"Do not use long_task for simple questions, small one-off edits, or quick command execution.",
+			"Use long_task with action create before tracking a new long-running task, then add_step and set_step as progress is made.",
+			"Use long_task add_artifact to attach important files, URLs, notes, or outputs to the task record.",
+		],
+		parameters: LongTaskToolParams,
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			try {
+				const result = executeLongTaskAction(ctx.cwd, params);
+				return {
+					content: [{ type: "text", text: result.text }],
+					details: result.details,
+				};
+			} catch (error) {
+				return {
+					content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }],
+					details: { error: error instanceof Error ? error.message : String(error) },
+					isError: true,
+				};
+			}
+		},
+	});
+
+	pi.registerCommand("task", {
+		description: "Create, inspect, update, and resume durable long tasks",
+		getArgumentCompletions: (prefix) => {
+			const actions = ["create", "list", "show", "add-step", "add-artifact", "set-task", "set-step", "resume"];
+			const filtered = actions.filter((action) => action.startsWith(prefix));
+			return filtered.length > 0 ? filtered.map((action) => ({ value: action, label: action })) : null;
+		},
+		handler: handleTaskCommand,
+	});
+}

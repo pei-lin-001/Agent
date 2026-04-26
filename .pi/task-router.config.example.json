@@ -1,0 +1,75 @@
+{
+	"enabled": true,
+	"defaultMode": "immediate",
+	"askWhenAmbiguous": true,
+	"longTaskStorageDir": ".pi/tasks",
+	"routing": {
+		"autoEscalateKeywords": ["长期任务", "后台", "持续推进", "拆成步骤", "复杂任务"],
+		"autoEscalateWhenMultiplePhases": true,
+		"autoEscalateWhenManyFilesLikely": true
+	},
+	"modelPolicies": {
+		"default": {
+			"provider": null,
+			"model": null,
+			"thinkingLevel": null
+		},
+		"coding": {
+			"provider": null,
+			"model": null,
+			"thinkingLevel": "high"
+		},
+		"reasoning": {
+			"provider": null,
+			"model": null,
+			"thinkingLevel": "high"
+		},
+		"longContext": {
+			"provider": null,
+			"model": null,
+			"thinkingLevel": "medium"
+		},
+		"cheapBatch": {
+			"provider": null,
+			"model": null,
+			"thinkingLevel": null
+		},
+		"chineseWriting": {
+			"provider": null,
+			"model": null,
+			"thinkingLevel": "medium"
+		}
+	},
+	"workers": {
+		"researcher": {
+			"enabled": true,
+			"permission": "read-only",
+			"modelPolicy": "longContext",
+			"allowParallel": true
+		},
+		"reviewer": {
+			"enabled": true,
+			"permission": "read-only",
+			"modelPolicy": "reasoning",
+			"allowParallel": true
+		},
+		"coder": {
+			"enabled": false,
+			"permission": "scoped-write",
+			"modelPolicy": "coding",
+			"allowParallel": false
+		},
+		"tester": {
+			"enabled": false,
+			"permission": "validation-only",
+			"modelPolicy": "coding",
+			"allowParallel": false
+		},
+		"docWriter": {
+			"enabled": false,
+			"permission": "scoped-write",
+			"modelPolicy": "chineseWriting",
+			"allowParallel": false
+		}
+	}
+}

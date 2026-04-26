@@ -40,4 +40,6 @@ plans/
 .pi/__pycache__/
 .pi/memory.config.json
 .pi/memory/
+.pi/task-router.config.json
+.pi/tasks/
 collect.sh
