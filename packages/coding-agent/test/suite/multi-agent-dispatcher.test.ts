@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import multiAgentDispatcherExtension, {
 	type AgentDispatchDecision,
 	classifyAgentRequest,
+	recommendAgentDispatch,
 } from "../../../../.pi/extensions/multi-agent-dispatcher.js";
 
 describe("classifyAgentRequest", () => {
@@ -101,5 +102,31 @@ describe("classifyAgentRequest", () => {
 		expect(() =>
 			multiAgentDispatcherExtension({} as Parameters<typeof multiAgentDispatcherExtension>[0]),
 		).not.toThrow();
+	});
+});
+
+describe("recommendAgentDispatch", () => {
+	it("maps immediate mode to answer_directly without task or worker planning", () => {
+		const rec = recommendAgentDispatch("帮我解释一下 mem0 是干什么的");
+		expect(rec.mode).toBe("immediate");
+		expect(rec.action).toBe("answer_directly");
+		expect(rec.shouldCreateTask).toBe(false);
+		expect(rec.shouldPlanWorkers).toBe(false);
+	});
+
+	it("maps long_task mode to use_long_task with task creation but no worker planning", () => {
+		const rec = recommendAgentDispatch("这个项目我要长期开发，帮我放进长期任务");
+		expect(rec.mode).toBe("long_task");
+		expect(rec.action).toBe("use_long_task");
+		expect(rec.shouldCreateTask).toBe(true);
+		expect(rec.shouldPlanWorkers).toBe(false);
+	});
+
+	it("maps multi_agent_candidate mode to plan_multi_agent with both task and worker planning", () => {
+		const rec = recommendAgentDispatch("我们要做多 agent 协作编排，包含调研、编码、测试和 review");
+		expect(rec.mode).toBe("multi_agent_candidate");
+		expect(rec.action).toBe("plan_multi_agent");
+		expect(rec.shouldCreateTask).toBe(true);
+		expect(rec.shouldPlanWorkers).toBe(true);
 	});
 });

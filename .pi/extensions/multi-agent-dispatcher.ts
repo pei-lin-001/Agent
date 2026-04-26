@@ -2,10 +2,18 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 
 export type AgentDispatchMode = "immediate" | "long_task" | "multi_agent_candidate";
 
+export type AgentDispatchAction = "answer_directly" | "use_long_task" | "plan_multi_agent";
+
 export interface AgentDispatchDecision {
 	mode: AgentDispatchMode;
 	reason: string;
 	signals: string[];
+}
+
+export interface AgentDispatchRecommendation extends AgentDispatchDecision {
+	action: AgentDispatchAction;
+	shouldCreateTask: boolean;
+	shouldPlanWorkers: boolean;
 }
 
 const MULTI_AGENT_PATTERNS: Array<{ pattern: RegExp; signal: string }> = [
@@ -90,6 +98,23 @@ export function classifyAgentRequest(prompt: string): AgentDispatchDecision {
 		mode: "immediate",
 		reason: "No long-term or multi-agent signals detected; defaulting to immediate mode.",
 		signals: [],
+	};
+}
+
+const MODE_ACTION_MAP: Record<AgentDispatchMode, { action: AgentDispatchAction; shouldCreateTask: boolean; shouldPlanWorkers: boolean }> = {
+	immediate: { action: "answer_directly", shouldCreateTask: false, shouldPlanWorkers: false },
+	long_task: { action: "use_long_task", shouldCreateTask: true, shouldPlanWorkers: false },
+	multi_agent_candidate: { action: "plan_multi_agent", shouldCreateTask: true, shouldPlanWorkers: true },
+};
+
+export function recommendAgentDispatch(prompt: string): AgentDispatchRecommendation {
+	const decision = classifyAgentRequest(prompt);
+	const mapped = MODE_ACTION_MAP[decision.mode];
+	return {
+		...decision,
+		action: mapped.action,
+		shouldCreateTask: mapped.shouldCreateTask,
+		shouldPlanWorkers: mapped.shouldPlanWorkers,
 	};
 }
 
