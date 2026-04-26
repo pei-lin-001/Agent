@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import type { ExtensionAPI, ExtensionCommandContext } from "@mariozechner/pi-coding-agent";
 import { StringEnum } from "@mariozechner/pi-ai";
 import { Type } from "typebox";
+import { classifyAgentRequest } from "./multi-agent-dispatcher.js";
 
 type TaskStatus = "pending" | "running" | "blocked" | "completed" | "failed" | "cancelled";
 type StepStatus = "pending" | "running" | "completed" | "failed" | "skipped" | "blocked";
@@ -530,6 +531,7 @@ export function buildTaskRoutingSystemPrompt(cwd: string, userPrompt: string): s
 	}
 	const keywords = config.routing?.autoEscalateKeywords ?? [];
 	const matchedKeywords = keywords.filter((keyword) => userPrompt.includes(keyword));
+	const decision = classifyAgentRequest(userPrompt);
 	const workerLines = Object.entries(config.workers ?? {})
 		.filter(([, worker]) => worker.enabled !== false)
 		.map(([name, worker]) => `- ${name}: permission=${worker.permission ?? "unspecified"}, modelPolicy=${worker.modelPolicy ?? "default"}`);
@@ -555,6 +557,9 @@ export function buildTaskRoutingSystemPrompt(cwd: string, userPrompt: string): s
 			? "If a request is ambiguous and tracking would add overhead, ask the user before creating a long task."
 			: "When ambiguous, use your best judgment without asking.",
 		matchedKeywords.length > 0 ? `Current request matched long-task keyword(s): ${matchedKeywords.join(", ")}.` : undefined,
+		`Dispatch classifier mode: ${decision.mode}.`,
+		`Dispatch classifier reason: ${decision.reason}`,
+		`Dispatch classifier signals: ${decision.signals.length > 0 ? decision.signals.join(", ") : "none"}`,
 		activeTaskLines.length > 0 ? `Active long tasks:\n${activeTaskLines.join("\n")}` : "Active long tasks: none.",
 		workerLines.length > 0 ? `Available worker hints:\n${workerLines.join("\n")}` : undefined,
 		modelPolicyLines.length > 0 ? `Available model policy hints:\n${modelPolicyLines.join("\n")}` : undefined,

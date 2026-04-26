@@ -166,6 +166,59 @@ describe("long task runner extension", () => {
 		expect(prompt).toContain("researcher");
 	});
 
+	it("includes multi-agent classifier output in routing prompt when prompt triggers multi_agent_candidate", () => {
+		const cwd = createTempDir();
+		tempDirs.push(cwd);
+		mkdirSync(join(cwd, ".pi"), { recursive: true });
+		writeFileSync(
+			join(cwd, ".pi", "task-router.config.json"),
+			JSON.stringify({ enabled: true, defaultMode: "immediate" }),
+			"utf-8",
+		);
+
+		const prompt = buildTaskRoutingSystemPrompt(cwd, "我们要做多 agent 协作编排，包含调研、编码、测试和 review");
+
+		expect(prompt).toContain("Dispatch classifier mode: multi_agent_candidate");
+		expect(prompt).toContain("Dispatch classifier reason:");
+		expect(prompt).toContain("Dispatch classifier signals:");
+		expect(prompt).toContain("multi_agent_keyword");
+	});
+
+	it("includes long_task classifier output in routing prompt when prompt triggers long-term work", () => {
+		const cwd = createTempDir();
+		tempDirs.push(cwd);
+		mkdirSync(join(cwd, ".pi"), { recursive: true });
+		writeFileSync(
+			join(cwd, ".pi", "task-router.config.json"),
+			JSON.stringify({ enabled: true, defaultMode: "immediate" }),
+			"utf-8",
+		);
+
+		const prompt = buildTaskRoutingSystemPrompt(cwd, "帮我规划一个复杂功能，后续多轮推进");
+
+		expect(prompt).toContain("Dispatch classifier mode: long_task");
+		expect(prompt).toContain("Dispatch classifier reason:");
+		expect(prompt).toContain("Dispatch classifier signals:");
+		expect(prompt).toContain("long_task_keyword_cn");
+	});
+
+	it("includes immediate classifier output in routing prompt when prompt triggers immediate mode", () => {
+		const cwd = createTempDir();
+		tempDirs.push(cwd);
+		mkdirSync(join(cwd, ".pi"), { recursive: true });
+		writeFileSync(
+			join(cwd, ".pi", "task-router.config.json"),
+			JSON.stringify({ enabled: true, defaultMode: "immediate" }),
+			"utf-8",
+		);
+
+		const prompt = buildTaskRoutingSystemPrompt(cwd, "帮我解释一下 mem0 是干什么的");
+
+		expect(prompt).toContain("Dispatch classifier mode: immediate");
+		expect(prompt).toContain("Dispatch classifier reason:");
+		expect(prompt).toContain("Dispatch classifier signals:");
+	});
+
 	it("registers the /task command and loads resume text into the editor", async () => {
 		const cwd = createTempDir();
 		tempDirs.push(cwd);
