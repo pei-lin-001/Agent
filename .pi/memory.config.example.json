@@ -1,0 +1,16 @@
+{
+	"enabled": true,
+	"baseUrl": "http://localhost:8000",
+	"addPath": "/memories",
+	"searchPath": "/search",
+	"apiKeyCommand": "security find-generic-password -a \"$USER\" -s \"mem0-admin-api-key\" -w",
+	"apiKeyHeader": "x-api-key",
+	"userId": "pei-lin",
+	"agentId": "personal-agent",
+	"topK": 5,
+	"requestTimeoutMs": 3000,
+	"failureCooldownMs": 60000,
+	"minPromptChars": 12,
+	"maxTurnChars": 12000,
+	"maxMemoryChars": 1200
+}
