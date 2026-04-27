@@ -4,12 +4,14 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import longTaskRunnerExtension, {
 	addTaskStep,
+	buildProgressBar,
 	buildResumePrompt,
 	buildTaskRoutingSystemPrompt,
 	createLongTask,
 	getTaskStorageDir,
 	readTask,
 	updateStepStatus,
+	updateTaskStatus,
 } from "../../../../.pi/extensions/long-task-runner.js";
 
 type CommandHandler = (args: string, ctx: FakeCommandContext) => Promise<void>;
@@ -27,6 +29,7 @@ type LongTaskToolParams = {
 		| "suggest_steps"
 		| "add_suggested_steps";
 	goal?: string;
+	sourcePrompt?: string;
 	taskId?: string;
 	title?: string;
 	stepId?: string;
@@ -37,6 +40,8 @@ type LongTaskToolParams = {
 	expectedOutput?: string;
 	allowedScope?: string[];
 	artifact?: string;
+	stepArtifacts?: string[];
+	notes?: string;
 };
 
 interface FakeToolResult {
@@ -205,7 +210,7 @@ describe("long task runner extension", () => {
 		expect(prompt).toContain("- tester:");
 		expect(prompt).toContain("- reviewer:");
 		expect(prompt).toContain(
-			"do not spawn workers unless a later implementation explicitly supports worker execution",
+			"Use the worker_execute tool to run researcher and reviewer workers. Coder, tester, and docWriter workers are available for later phases.",
 		);
 	});
 
@@ -538,6 +543,139 @@ describe("long task runner extension", () => {
 		expect(task.plan).toHaveLength(4);
 	});
 
+	it("suggest_steps uses sourcePrompt over goal, preserving multi-agent signals when goal is shortened", async () => {
+		const cwd = createTempDir();
+		tempDirs.push(cwd);
+		mkdirSync(join(cwd, ".pi"), { recursive: true });
+		writeFileSync(
+			join(cwd, ".pi", "task-router.config.json"),
+			JSON.stringify({ enabled: true, defaultMode: "immediate" }),
+			"utf-8",
+		);
+
+		const { tools } = createExtensionHarness();
+		const longTaskTool = tools.get("long_task");
+		expect(longTaskTool).toBeDefined();
+
+		const result = await longTaskTool!.execute(
+			"tool-call-1",
+			{
+				action: "suggest_steps",
+				goal: "Add regression test",
+				sourcePrompt: "我们要做多 agent 协作编排，包含调研、编码、测试和 review",
+			},
+			undefined,
+			undefined,
+			{ cwd },
+		);
+
+		expect(result.isError).toBeFalsy();
+		expect(result.content[0]!.text).toContain("[researcher]");
+		expect(result.content[0]!.text).toContain("[coder]");
+		expect(result.content[0]!.text).toContain("[tester]");
+		expect(result.content[0]!.text).toContain("[reviewer]");
+	});
+
+	it("add_suggested_steps uses sourcePrompt when goal is shortened, preserving multi-agent signals", async () => {
+		const cwd = createTempDir();
+		tempDirs.push(cwd);
+		mkdirSync(join(cwd, ".pi"), { recursive: true });
+		writeFileSync(
+			join(cwd, ".pi", "task-router.config.json"),
+			JSON.stringify({ enabled: true, defaultMode: "immediate" }),
+			"utf-8",
+		);
+
+		const { tools } = createExtensionHarness();
+		const longTaskTool = tools.get("long_task");
+		expect(longTaskTool).toBeDefined();
+
+		const createResult = await longTaskTool!.execute(
+			"tool-call-1",
+			{ action: "create", goal: "Add regression test" },
+			undefined,
+			undefined,
+			{ cwd },
+		);
+		const taskId = createResult.content[0]!.text.match(/id: ([^\n]+)/)?.[1];
+		expect(taskId).toBeDefined();
+
+		const addResult = await longTaskTool!.execute(
+			"tool-call-2",
+			{
+				action: "add_suggested_steps",
+				taskId,
+				sourcePrompt: "我们要做多 agent 协作编排，包含调研、编码、测试和 review",
+			},
+			undefined,
+			undefined,
+			{ cwd },
+		);
+
+		expect(addResult.content[0]!.text).toContain("Added 4 step(s) to task");
+		const task = readTask(cwd, taskId!);
+		expect(task.plan).toHaveLength(4);
+		expect(task.plan[0]!.worker).toBe("researcher");
+	});
+
+	it("add_suggested_steps falls back to task.originalPrompt when sourcePrompt is missing", async () => {
+		const cwd = createTempDir();
+		tempDirs.push(cwd);
+		mkdirSync(join(cwd, ".pi"), { recursive: true });
+		writeFileSync(
+			join(cwd, ".pi", "task-router.config.json"),
+			JSON.stringify({ enabled: true, defaultMode: "immediate" }),
+			"utf-8",
+		);
+
+		const { tools } = createExtensionHarness();
+		const longTaskTool = tools.get("long_task");
+		expect(longTaskTool).toBeDefined();
+
+		const createResult = await longTaskTool!.execute(
+			"tool-call-1",
+			{
+				action: "create",
+				goal: "Short summary",
+				sourcePrompt: "我们要做多 agent 协作编排，包含调研、编码、测试和 review",
+			},
+			undefined,
+			undefined,
+			{ cwd },
+		);
+		const taskId = createResult.content[0]!.text.match(/id: ([^\n]+)/)?.[1];
+		expect(taskId).toBeDefined();
+
+		const task = readTask(cwd, taskId!);
+		expect(task.originalPrompt).toBe("我们要做多 agent 协作编排，包含调研、编码、测试和 review");
+		expect(task.goal).toBe("Short summary");
+
+		const addResult = await longTaskTool!.execute(
+			"tool-call-2",
+			{ action: "add_suggested_steps", taskId },
+			undefined,
+			undefined,
+			{ cwd },
+		);
+
+		expect(addResult.content[0]!.text).toContain("Added 4 step(s) to task");
+	});
+
+	it("routing prompt includes sourcePrompt guidance", () => {
+		const cwd = createTempDir();
+		tempDirs.push(cwd);
+		mkdirSync(join(cwd, ".pi"), { recursive: true });
+		writeFileSync(
+			join(cwd, ".pi", "task-router.config.json"),
+			JSON.stringify({ enabled: true, defaultMode: "immediate" }),
+			"utf-8",
+		);
+
+		const prompt = buildTaskRoutingSystemPrompt(cwd, "我们要做多 agent 协作编排，包含调研、编码、测试和 review");
+
+		expect(prompt).toContain("pass the original user request as sourcePrompt, not a shortened goal summary");
+	});
+
 	it("resume prompt displays worker and expectedOutput metadata when present", () => {
 		const cwd = createTempDir();
 		tempDirs.push(cwd);
@@ -564,5 +702,373 @@ describe("long task runner extension", () => {
 		expect(prompt).toContain("expectedOutput: Concise findings, relevant files, risks, and assumptions.");
 		expect(prompt).toContain("worker: coder");
 		expect(prompt).toContain("expectedOutput: Changed files and implementation summary.");
+	});
+
+	it("resume prompt includes Lead Execution Protocol", () => {
+		const cwd = createTempDir();
+		tempDirs.push(cwd);
+		const task = createLongTask(cwd, "Implement a durable task runner.");
+		addTaskStep(cwd, task.id, "Research patterns", { worker: "researcher" });
+		const updated = readTask(cwd, task.id);
+		const prompt = buildResumePrompt(updated);
+
+		expect(prompt).toContain("# Lead Execution Protocol");
+		expect(prompt).toContain("Execute ONLY the current pending/running step");
+		expect(prompt).toContain("Use the worker_execute tool to delegate work to researcher and reviewer workers");
+		expect(prompt).toContain(
+			"researcher: READ-ONLY. Use read, grep, find, ls. Output findings, relevant files, risks, assumptions.",
+		);
+		expect(prompt).toContain(
+			"coder: SCOPED WRITE. Only edit files in allowedScope. If no allowedScope, declare files before editing.",
+		);
+		expect(prompt).toContain("tester: VALIDATION ONLY. Run test commands. Report pass/fail with error details.");
+		expect(prompt).toContain(
+			"reviewer: READ-ONLY. Review diffs and test coverage. Output findings ordered by severity.",
+		);
+		expect(prompt).toContain(
+			"docWriter: DOCS ONLY. Edit documentation files, or explain why no docs changes are needed.",
+		);
+	});
+
+	it("resume prompt includes current step details and do-not-replan instruction", () => {
+		const cwd = createTempDir();
+		tempDirs.push(cwd);
+		const task = createLongTask(cwd, "Implement a durable task runner.");
+		addTaskStep(cwd, task.id, "Research context and constraints", {
+			worker: "researcher",
+			expectedOutput: "Concise findings, relevant files, risks, and assumptions.",
+			allowedScope: [".pi/extensions/", "packages/coding-agent/src/core/"],
+		});
+		const updated = readTask(cwd, task.id);
+		const prompt = buildResumePrompt(updated);
+		const currentStep = updated.plan[0]!;
+
+		expect(prompt).toContain("# 当前步骤详情");
+		expect(prompt).toContain(`当前步骤 ID：${currentStep.id}`);
+		expect(prompt).toContain("Worker 角色：researcher");
+		expect(prompt).toContain("预期输出：Concise findings, relevant files, risks, and assumptions.");
+		expect(prompt).toContain("允许修改范围：.pi/extensions/, packages/coding-agent/src/core/");
+		expect(prompt).toContain("## 重要：不要重新规划！");
+		expect(prompt).toContain("你正在恢复之前规划好的任务。请直接继续执行当前步骤，不要重新分析或重新规划。");
+		expect(prompt).toContain("只执行当前这一个步骤，完成后立即调用 long_task set_step 更新步骤状态。");
+		expect(prompt).toContain("不要跳到后面的步骤，不要并行执行，不要创建子 agent。");
+	});
+
+	it("routing prompt always includes Tool Failure Recovery", () => {
+		const cwd = createTempDir();
+		tempDirs.push(cwd);
+		mkdirSync(join(cwd, ".pi"), { recursive: true });
+		writeFileSync(
+			join(cwd, ".pi", "task-router.config.json"),
+			JSON.stringify({ enabled: true, defaultMode: "immediate" }),
+			"utf-8",
+		);
+
+		const prompt = buildTaskRoutingSystemPrompt(cwd, "帮我解释一下 mem0 是干什么的");
+
+		expect(prompt).toContain("# Tool Call Failure Recovery");
+		expect(prompt).toContain("Read the error message carefully");
+		expect(prompt).toContain("Do NOT repeat the same failing call unchanged");
+		expect(prompt).toContain("If the same tool fails twice consecutively");
+		expect(prompt).toContain("For edit failures: read the target file");
+		expect(prompt).toContain("For bash failures: verify command syntax");
+		expect(prompt).toContain("call long_task set_step blocked and explain what failed");
+	});
+
+	it("routing prompt includes Lead Execution Protocol when active tasks exist", () => {
+		const cwd = createTempDir();
+		tempDirs.push(cwd);
+		mkdirSync(join(cwd, ".pi"), { recursive: true });
+		writeFileSync(
+			join(cwd, ".pi", "task-router.config.json"),
+			JSON.stringify({ enabled: true, defaultMode: "immediate" }),
+			"utf-8",
+		);
+
+		createLongTask(cwd, "An ongoing multi-step task.");
+		const prompt = buildTaskRoutingSystemPrompt(cwd, "继续推进");
+
+		expect(prompt).toContain("# Lead Execution Protocol");
+		expect(prompt).toContain("Execute ONLY the current pending/running step");
+		expect(prompt).toContain("Use the worker_execute tool to delegate work to researcher and reviewer workers");
+	});
+
+	it("routing prompt does NOT include Lead Execution Protocol when no active tasks exist", () => {
+		const cwd = createTempDir();
+		tempDirs.push(cwd);
+		mkdirSync(join(cwd, ".pi"), { recursive: true });
+		writeFileSync(
+			join(cwd, ".pi", "task-router.config.json"),
+			JSON.stringify({ enabled: true, defaultMode: "immediate" }),
+			"utf-8",
+		);
+
+		const prompt = buildTaskRoutingSystemPrompt(cwd, "帮我解释一下 mem0 是干什么的");
+
+		expect(prompt).toContain("# Tool Call Failure Recovery");
+		expect(prompt).not.toContain("# Lead Execution Protocol");
+	});
+
+	it("resume prompt includes allowedScope enforcement rules", () => {
+		const cwd = createTempDir();
+		tempDirs.push(cwd);
+		const task = createLongTask(cwd, "Implement a scoped change.");
+		addTaskStep(cwd, task.id, "Implement changes", {
+			worker: "coder",
+			allowedScope: ["packages/coding-agent/src/core/"],
+		});
+		const updated = readTask(cwd, task.id);
+		const prompt = buildResumePrompt(updated);
+
+		expect(prompt).toContain("If the current step has allowedScope, you MUST NOT edit files outside that scope.");
+		expect(prompt).toContain(
+			"If the current step has no allowedScope, you MUST state which files you will modify before editing.",
+		);
+		expect(prompt).toContain(
+			"If you need to edit a file outside allowedScope, mark the step blocked and explain why.",
+		);
+	});
+
+	it("set_step stores stepArtifacts and notes on a step", async () => {
+		const cwd = createTempDir();
+		tempDirs.push(cwd);
+		const { tools } = createExtensionHarness();
+		const longTaskTool = tools.get("long_task");
+		expect(longTaskTool).toBeDefined();
+
+		const createResult = await longTaskTool!.execute(
+			"tool-call-1",
+			{ action: "create", goal: "Track implementation with step artifacts." },
+			undefined,
+			undefined,
+			{ cwd },
+		);
+		const taskId = createResult.content[0]!.text.match(/id: ([^\n]+)/)?.[1];
+		expect(taskId).toBeDefined();
+
+		await longTaskTool!.execute(
+			"tool-call-2",
+			{ action: "add_step", taskId, title: "Research context" },
+			undefined,
+			undefined,
+			{ cwd },
+		);
+
+		const task = readTask(cwd, taskId!);
+		const stepId = task.plan[0]!.id;
+
+		await longTaskTool!.execute(
+			"tool-call-3",
+			{
+				action: "set_step",
+				taskId,
+				stepId,
+				status: "completed",
+				message: "Research complete",
+				stepArtifacts: [".pi/findings.md", ".pi/risks.md"],
+				notes: "Key risk: SDK version mismatch",
+			},
+			undefined,
+			undefined,
+			{ cwd },
+		);
+
+		const updated = readTask(cwd, taskId!);
+		const step = updated.plan[0]!;
+		expect(step.status).toBe("completed");
+		expect(step.output).toBe("Research complete");
+		expect(step.artifacts).toEqual([".pi/findings.md", ".pi/risks.md"]);
+		expect(step.notes).toBe("Key risk: SDK version mismatch");
+	});
+
+	it("step-level artifacts propagate to task-level artifact list", async () => {
+		const cwd = createTempDir();
+		tempDirs.push(cwd);
+		const { tools } = createExtensionHarness();
+		const longTaskTool = tools.get("long_task");
+		expect(longTaskTool).toBeDefined();
+
+		const createResult = await longTaskTool!.execute(
+			"tool-call-1",
+			{ action: "create", goal: "Track implementation." },
+			undefined,
+			undefined,
+			{ cwd },
+		);
+		const taskId = createResult.content[0]!.text.match(/id: ([^\n]+)/)?.[1];
+		expect(taskId).toBeDefined();
+
+		await longTaskTool!.execute(
+			"tool-call-2",
+			{ action: "add_step", taskId, title: "Step 1" },
+			undefined,
+			undefined,
+			{ cwd },
+		);
+
+		let task = readTask(cwd, taskId!);
+		const step1Id = task.plan[0]!.id;
+
+		await longTaskTool!.execute(
+			"tool-call-3",
+			{
+				action: "set_step",
+				taskId,
+				stepId: step1Id,
+				status: "completed",
+				stepArtifacts: ["file-a.ts", "file-b.ts"],
+			},
+			undefined,
+			undefined,
+			{ cwd },
+		);
+
+		task = readTask(cwd, taskId!);
+		expect(task.artifacts).toContain("file-a.ts");
+		expect(task.artifacts).toContain("file-b.ts");
+	});
+
+	it("show output displays step artifacts and notes inline", async () => {
+		const cwd = createTempDir();
+		tempDirs.push(cwd);
+		const { tools } = createExtensionHarness();
+		const longTaskTool = tools.get("long_task");
+		expect(longTaskTool).toBeDefined();
+
+		const createResult = await longTaskTool!.execute(
+			"tool-call-1",
+			{ action: "create", goal: "Track with artifacts." },
+			undefined,
+			undefined,
+			{ cwd },
+		);
+		const taskId = createResult.content[0]!.text.match(/id: ([^\n]+)/)?.[1];
+		expect(taskId).toBeDefined();
+
+		await longTaskTool!.execute(
+			"tool-call-2",
+			{ action: "add_step", taskId, title: "Research step" },
+			undefined,
+			undefined,
+			{ cwd },
+		);
+
+		const task = readTask(cwd, taskId!);
+		const stepId = task.plan[0]!.id;
+
+		await longTaskTool!.execute(
+			"tool-call-3",
+			{
+				action: "set_step",
+				taskId,
+				stepId,
+				status: "completed",
+				stepArtifacts: [".pi/findings.md"],
+				notes: "Important observation",
+			},
+			undefined,
+			undefined,
+			{ cwd },
+		);
+
+		const showResult = await longTaskTool!.execute("tool-call-4", { action: "show", taskId }, undefined, undefined, {
+			cwd,
+		});
+
+		expect(showResult.content[0]!.text).toContain("artifacts: .pi/findings.md");
+		expect(showResult.content[0]!.text).toContain("notes: Important observation");
+	});
+
+	it("resume prompt includes step artifacts and notes", () => {
+		const cwd = createTempDir();
+		tempDirs.push(cwd);
+		const task = createLongTask(cwd, "Track with step artifacts.");
+		addTaskStep(cwd, task.id, "Research context", {
+			worker: "researcher",
+			expectedOutput: "Concise findings, relevant files, risks, and assumptions.",
+		});
+		const updated = readTask(cwd, task.id);
+		const stepId = updated.plan[0]!.id;
+		updateStepStatus(
+			cwd,
+			task.id,
+			stepId,
+			"completed",
+			"Research done",
+			[".pi/findings.md"],
+			"Risk: version mismatch",
+		);
+		const task2 = readTask(cwd, task.id);
+		addTaskStep(cwd, task2.id, "Implement changes", { worker: "coder" });
+		const final = readTask(cwd, task.id);
+		const prompt = buildResumePrompt(final);
+
+		expect(prompt).toContain("artifacts: .pi/findings.md");
+		expect(prompt).toContain("notes: Risk: version mismatch");
+	});
+
+	it("Lead Execution Protocol includes step artifact rules", () => {
+		const cwd = createTempDir();
+		tempDirs.push(cwd);
+		const task = createLongTask(cwd, "Test artifact rules.");
+		addTaskStep(cwd, task.id, "Research", { worker: "researcher" });
+		const updated = readTask(cwd, task.id);
+		const prompt = buildResumePrompt(updated);
+
+		expect(prompt).toContain("## Step Artifact Rules");
+		expect(prompt).toContain("When completing a step via long_task set_step, always include stepArtifacts:");
+		expect(prompt).toContain("- researcher: file paths of findings docs, relevant source files, risk assessments");
+		expect(prompt).toContain("- coder: list of changed files with a brief summary of what changed");
+		expect(prompt).toContain("- tester: test command outputs, pass/fail status, failure details");
+		expect(prompt).toContain("- reviewer: findings ordered by severity with file references");
+		expect(prompt).toContain(
+			"- docWriter: changed doc file paths, or explanation of why no docs changes were needed",
+		);
+		expect(prompt).toContain("Use the notes parameter to add freeform observations, warnings, or context.");
+	});
+
+	// ── Phase 8: Dashboard UX ──────────────────────────────────────────
+
+	it("buildProgressBar produces correct bar for various ratios", () => {
+		// buildProgressBar is imported at the top
+		expect(buildProgressBar(0, 10, 10)).toBe("[░░░░░░░░░░]");
+		expect(buildProgressBar(5, 10, 10)).toBe("[█████░░░░░]");
+		expect(buildProgressBar(10, 10, 10)).toBe("[██████████]");
+		expect(buildProgressBar(0, 0, 10)).toBe("[░░░░░░░░░░]");
+		expect(buildProgressBar(1, 3, 6)).toBe("[██░░░░]");
+	});
+
+	it("formatTaskSummary in routing prompt includes progress info", () => {
+		const cwd = createTempDir();
+		tempDirs.push(cwd);
+		const task = createLongTask(cwd, "Test summary formatting.");
+		addTaskStep(cwd, task.id, "Research", { worker: "researcher" });
+		addTaskStep(cwd, task.id, "Implement", { worker: "coder" });
+		addTaskStep(cwd, task.id, "Test", { worker: "tester" });
+		let updated = readTask(cwd, task.id);
+		const step1Id = updated.plan[0]!.id;
+		updateStepStatus(cwd, task.id, step1Id, "completed", "Done");
+		updated = readTask(cwd, task.id);
+		// Trigger routing prompt generation which uses formatTaskSummary
+		const prompt = buildTaskRoutingSystemPrompt(cwd, "status check");
+		expect(prompt).toContain("1/3");
+	});
+
+	it("/task list separates active from completed tasks", async () => {
+		const cwd = createTempDir();
+		tempDirs.push(cwd);
+		const { commands } = createExtensionHarness();
+		const ctx = createFakeContext(cwd);
+
+		// Create an active task
+		createLongTask(cwd, "Active task 1");
+		// Create and complete a task - direct write to bypass async import issues
+		// updateTaskStatus is now imported at the top
+		const done = createLongTask(cwd, "Completed task");
+		updateTaskStatus(cwd, done.id, "completed");
+
+		await commands.get("task")!("list", ctx);
+		const notification = ctx.ui.notifications.at(-1)?.message ?? "";
+		expect(notification).toContain("Active");
 	});
 });

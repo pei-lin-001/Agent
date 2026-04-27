@@ -51,6 +51,8 @@ export interface LongTaskStep {
 	allowedScope?: string[];
 	startedAt?: string;
 	completedAt?: string;
+	artifacts?: string[];
+	notes?: string;
 }
 
 export interface LongTaskRecord {
@@ -61,6 +63,7 @@ export interface LongTaskRecord {
 	updatedAt: string;
 	mode: "long-task";
 	goal: string;
+	originalPrompt?: string;
 	plan: LongTaskStep[];
 	currentStepId?: string;
 	artifacts: string[];
@@ -92,6 +95,12 @@ const LongTaskToolParams = Type.Object({
 		description: "Long task action to perform.",
 	}),
 	goal: Type.Optional(Type.String({ description: "Goal for create, suggest_steps, or add_suggested_steps." })),
+	sourcePrompt: Type.Optional(
+		Type.String({
+			description:
+				"Original user prompt for create, suggest_steps, or add_suggested_steps. Use this to preserve multi-agent signals when the goal is a short summary.",
+		}),
+	),
 	taskId: Type.Optional(
 		Type.String({ description: "Task id for show, add_step, set_task, set_step, add_artifact, resume, or add_suggested_steps." }),
 	),
@@ -104,6 +113,8 @@ const LongTaskToolParams = Type.Object({
 	expectedOutput: Type.Optional(Type.String({ description: "Optional expected output description for add_step." })),
 	allowedScope: Type.Optional(Type.Array(Type.String(), { description: "Optional allowed scope for add_step." })),
 	artifact: Type.Optional(Type.String({ description: "Artifact path, URL, or note for add_artifact." })),
+	stepArtifacts: Type.Optional(Type.Array(Type.String(), { description: "Step-level artifacts when calling set_step (file paths, URLs, or notes produced by the step)." })),
+	notes: Type.Optional(Type.String({ description: "Optional freeform notes to attach to the step when calling set_step." })),
 });
 
 function nowIso(): string {
@@ -202,7 +213,7 @@ function firstSentence(text: string): string {
 	return `${normalized.slice(0, 77)}...`;
 }
 
-export function createLongTask(cwd: string, goal: string, title?: string): LongTaskRecord {
+export function createLongTask(cwd: string, goal: string, title?: string, originalPrompt?: string): LongTaskRecord {
 	const cleanGoal = goal.trim();
 	if (!cleanGoal) {
 		throw new Error("Task goal is required");
@@ -217,6 +228,7 @@ export function createLongTask(cwd: string, goal: string, title?: string): LongT
 		updatedAt: timestamp,
 		mode: "long-task",
 		goal: cleanGoal,
+		originalPrompt: originalPrompt?.trim() || undefined,
 		plan: [],
 		artifacts: [],
 		memoryKeys: [`task:${taskTitle}`],
@@ -289,6 +301,8 @@ export function updateStepStatus(
 	stepId: string,
 	status: StepStatus,
 	message?: string,
+	stepArtifacts?: string[],
+	notes?: string,
 ): LongTaskRecord {
 	if (!VALID_STEP_STATUSES.includes(status)) {
 		throw new Error(`Invalid step status: ${status}`);
@@ -311,6 +325,17 @@ export function updateStepStatus(
 	if (status === "failed" && message?.trim()) {
 		step.error = message.trim();
 	}
+	if (stepArtifacts?.length) {
+		step.artifacts = stepArtifacts.filter((a): a is string => a?.trim().length > 0);
+		for (const artifact of step.artifacts) {
+			if (!task.artifacts.includes(artifact)) {
+				task.artifacts.push(artifact);
+			}
+		}
+	}
+	if (notes?.trim()) {
+		step.notes = notes.trim();
+	}
 	task.currentStepId = task.plan.find((candidate) => candidate.status === "pending" || candidate.status === "running")?.id;
 	if (task.plan.length > 0 && task.plan.every((candidate) => candidate.status === "completed" || candidate.status === "skipped")) {
 		task.status = "completed";
@@ -325,14 +350,34 @@ function parseTaskCommand(args: string): ParsedTaskCommand {
 	return { action: parts[0] ?? "help", args: parts.slice(1) };
 }
 
+export function buildProgressBar(completed: number, total: number, width: number): string {
+	if (total === 0) return `[${"░".repeat(width)}]`;
+	const filled = Math.round((completed / total) * width);
+	return `[${"█".repeat(filled)}${"░".repeat(width - filled)}]`;
+}
+
 function formatTaskSummary(task: LongTaskRecord): string {
 	const nextStep = task.plan.find((step) => step.status === "pending" || step.status === "running");
+	const runningStep = task.plan.find((step) => step.status === "running");
+	const totalSteps = task.plan.length;
+	const completedSteps = task.plan.filter((step) => step.status === "completed").length;
+	const failedSteps = task.plan.filter((step) => step.status === "failed" || step.status === "blocked").length;
+	const progressBar = totalSteps > 0 ? ` ${buildProgressBar(completedSteps, totalSteps, 10)}` : "";
+	const workerStatuses = task.plan
+		.filter((step) => step.worker && step.status !== "pending")
+		.slice(0, 6)
+		.map((step) => {
+			const icon = step.status === "completed" ? "✓" : step.status === "running" ? "…" : step.status === "failed" ? "✗" : step.status === "skipped" ? "⏭" : "⊘";
+			return `${icon}${step.worker}:${step.title.slice(0, 20)}`;
+		});
 	return [
-		`${task.title}`,
+		`${task.status === "running" ? "▶" : task.status === "completed" ? "✓" : task.status === "blocked" ? "⊘" : "○"} ${task.title}`,
 		`id: ${task.id}`,
-		`status: ${task.status}`,
-		`steps: ${task.plan.filter((step) => step.status === "completed").length}/${task.plan.length}`,
-		nextStep ? `next: ${nextStep.id} ${nextStep.title}` : undefined,
+		`status: ${task.status}${progressBar}  ${completedSteps}/${totalSteps} steps`,
+		failedSteps > 0 ? `⚠ ${failedSteps} step(s) failed or blocked` : undefined,
+		runningStep ? `running: [${runningStep.worker ?? "?"}] ${runningStep.title}` : undefined,
+		nextStep && !runningStep ? `next: [${nextStep.worker ?? "?"}] ${nextStep.title}` : undefined,
+		workerStatuses.length > 0 ? workerStatuses.join(" | ") : undefined,
 	].filter((line): line is string => !!line).join("\n");
 }
 
@@ -489,7 +534,20 @@ function formatTaskDetails(task: LongTaskRecord): string {
 				const hints = [step.worker ? `worker:${step.worker}` : undefined, step.modelPolicy ? `model:${step.modelPolicy}` : undefined]
 					.filter((hint): hint is string => !!hint)
 					.join(" ");
-				return `- ${step.id} [${step.status}] ${step.title}${hints ? ` (${hints})` : ""}`;
+				const statusIcons: Record<string, string> = { pending: "○", running: "▶", completed: "✓", failed: "✗", skipped: "⏭", blocked: "⊘" };
+				const icon = statusIcons[step.status] ?? "?";
+				const line = `  ${icon} ${step.id} [${step.status}] ${step.title}${hints ? ` (${hints})` : ""}`;
+				const extras: string[] = [];
+				if (step.expectedOutput) extras.push(`       expected: ${step.expectedOutput}`);
+				if (step.artifacts?.length) extras.push(`       artifacts: ${step.artifacts.join(", ")}`);
+				if (step.notes) extras.push(`       notes: ${step.notes}`);
+				if (step.startedAt && step.completedAt) {
+					const duration = new Date(step.completedAt).getTime() - new Date(step.startedAt).getTime();
+					if (duration > 0) extras.push(`       took: ${Math.round(duration / 1000)}s`);
+				}
+				if (step.error) extras.push(`       error: ${step.error.slice(0, 200)}`);
+				if (step.output) extras.push(`       output: ${step.output.slice(0, 200)}`);
+				return extras.length > 0 ? `${line}\n${extras.join("\n")}` : line;
 			})
 			.join("\n");
 	const artifacts = task.artifacts.length === 0 ? "No artifacts yet." : task.artifacts.map((artifact) => `- ${artifact}`).join("\n");
@@ -512,15 +570,33 @@ function formatTaskDetails(task: LongTaskRecord): string {
 export function buildResumePrompt(task: LongTaskRecord): string {
 	const completedSteps = task.plan.filter((step) => step.status === "completed");
 	const nextStep = task.plan.find((step) => step.status === "pending" || step.status === "running");
+	const currentStep = task.plan.find((step) => step.id === task.currentStepId) ?? nextStep;
+
 	function formatStepLine(step: LongTaskStep): string {
 		const meta = [
 			step.worker ? `worker: ${step.worker}` : undefined,
 			step.expectedOutput ? `expectedOutput: ${step.expectedOutput}` : undefined,
 			step.allowedScope?.length ? `allowedScope: ${step.allowedScope.join(", ")}` : undefined,
+			step.artifacts?.length ? `artifacts: ${step.artifacts.join(", ")}` : undefined,
+			step.notes ? `notes: ${step.notes}` : undefined,
 		].filter((line): line is string => !!line);
 		const primary = `- ${step.id}: ${step.title}`;
 		return meta.length > 0 ? `${primary}\n  ${meta.join("\n  ")}` : primary;
 	}
+
+	function formatCurrentStep(step: LongTaskStep): string {
+		return [
+			`当前步骤 ID：${step.id}`,
+			`标题：${step.title}`,
+			step.worker ? `Worker 角色：${step.worker}` : undefined,
+			step.expectedOutput ? `预期输出：${step.expectedOutput}` : undefined,
+			step.allowedScope?.length ? `允许修改范围：${step.allowedScope.join(", ")}` : undefined,
+			step.input ? `步骤输入：${step.input}` : undefined,
+			step.artifacts?.length ? `步骤产物：${step.artifacts.join(", ")}` : undefined,
+			step.notes ? `步骤笔记：${step.notes}` : undefined,
+		].filter((line): line is string => !!line).join("\n");
+	}
+
 	return [
 		`继续长期任务：${task.title}`,
 		"",
@@ -538,8 +614,75 @@ export function buildResumePrompt(task: LongTaskRecord): string {
 			? `下一步：${formatStepLine(nextStep)}`
 			: "下一步：请先根据目标补充计划步骤。",
 		task.artifacts.length > 0 ? `\n相关产物：\n${task.artifacts.map((artifact) => `- ${artifact}`).join("\n")}` : "",
+		currentStep
+			? [
+					"",
+					"# 当前步骤详情",
+					formatCurrentStep(currentStep),
+					"",
+					"## 重要：不要重新规划！",
+					"你正在恢复之前规划好的任务。请直接继续执行当前步骤，不要重新分析或重新规划。",
+					"只执行当前这一个步骤，完成后立即调用 long_task set_step 更新步骤状态。",
+					"不要跳到后面的步骤，不要并行执行，不要创建子 agent。",
+				].join("\n")
+			: "",
 		"",
 		"请先简要复述当前进度，再继续推进下一步。",
+		buildLeadExecutionProtocol(),
+	].filter((line): line is string => !!line).join("\n");
+}
+
+export function buildLeadExecutionProtocol(): string {
+	return [
+		"",
+		"# Lead Execution Protocol",
+		"When you are the lead agent for a long task, follow these rules strictly:",
+		"",
+		"## Step Execution",
+		"1. Before any action, use long_task show to read the current task state.",
+		"2. Execute ONLY the current pending/running step. Do NOT jump ahead to later steps.",
+		"3. Execute ONE step at a time. Do NOT batch or parallelize multiple steps.",
+		"4. When a step is finished, immediately call long_task set_step with completed/failed/blocked.",
+		"5. Do NOT skip steps. Mark them skipped explicitly if needed.",
+		"6. Use the worker_execute tool to delegate work to researcher and reviewer workers. Do NOT spawn workers manually.",
+		"",
+		"## Worker Role Behavior",
+		"Your behavior depends on the current step's worker role:",
+		"- researcher: READ-ONLY. Use read, grep, find, ls. Output findings, relevant files, risks, assumptions.",
+		"- coder: SCOPED WRITE. Only edit files in allowedScope. If no allowedScope, declare files before editing.",
+		"- tester: VALIDATION ONLY. Run test commands. Report pass/fail with error details.",
+		"- reviewer: READ-ONLY. Review diffs and test coverage. Output findings ordered by severity.",
+		"- docWriter: DOCS ONLY. Edit documentation files, or explain why no docs changes are needed.",
+		"",
+		"## allowedScope Enforcement",
+		"If the current step has allowedScope, you MUST NOT edit files outside that scope.",
+		"If the current step has no allowedScope, you MUST state which files you will modify before editing.",
+		"If you need to edit a file outside allowedScope, mark the step blocked and explain why.",
+		"",
+		"## Step Artifact Rules",
+		"When completing a step via long_task set_step, always include stepArtifacts:",
+		"- researcher: file paths of findings docs, relevant source files, risk assessments",
+		"- coder: list of changed files with a brief summary of what changed",
+		"- tester: test command outputs, pass/fail status, failure details",
+		"- reviewer: findings ordered by severity with file references",
+		"- docWriter: changed doc file paths, or explanation of why no docs changes were needed",
+		"Use the notes parameter to add freeform observations, warnings, or context.",
+		"Step artifacts are automatically added to the task artifact list.",
+	].join("\n");
+}
+
+export function buildToolFailureRecoveryPrompt(): string {
+	return [
+		"",
+		"# Tool Call Failure Recovery",
+		"When a tool call returns an error:",
+		"1. Read the error message carefully. Understand what went wrong before retrying.",
+		"2. Construct a corrected call with minimal, correct parameters.",
+		"3. Do NOT repeat the same failing call unchanged.",
+		"4. If the same tool fails twice consecutively:",
+		"   - For edit failures: read the target file, then retry with corrected parameters or use write instead.",
+		"   - For bash failures: verify command syntax, try a simpler variant.",
+		"   - If recovery is not possible, call long_task set_step blocked and explain what failed.",
 	].join("\n");
 }
 
@@ -560,11 +703,12 @@ export function buildTaskRoutingSystemPrompt(cwd: string, userPrompt: string): s
 			const model = policy.provider && policy.model ? `${policy.provider}/${policy.model}` : "current/default model";
 			return `- ${name}: ${model}${policy.thinkingLevel ? `, thinking=${policy.thinkingLevel}` : ""}`;
 		});
-	const activeTaskLines = listTasks(cwd)
-		.filter(isActiveTask)
-		.slice(0, 8)
-		.map((task) => `- ${formatTaskSummary(task).replace(/\n/g, "\n  ")}`);
+	const activeTasks = listTasks(cwd).filter(isActiveTask);
+	const activeTaskLines = activeTasks.slice(0, 8).map((task) => `- ${formatTaskSummary(task).replace(/\n/g, "\n  ")}`);
+	const hasActiveTasks = activeTasks.length > 0;
 	return [
+		buildToolFailureRecoveryPrompt(),
+		hasActiveTasks ? buildLeadExecutionProtocol() : undefined,
 		"",
 		"# Personal Task Routing",
 		`Default mode: ${config.defaultMode ?? "immediate"}.`,
@@ -573,6 +717,7 @@ export function buildTaskRoutingSystemPrompt(cwd: string, userPrompt: string): s
 		"Before creating a new long task, check the active long tasks below. If one already covers the user's request, reuse it by showing, resuming, or updating that existing task instead of creating a duplicate.",
 		"When an active task has a next pending/running step matching the user's request, continue that step and use the exact task id from the active task list.",
 		"Create a new long task only when no active task matches the goal.",
+		"When calling long_task suggest_steps or add_suggested_steps, pass the original user request as sourcePrompt, not a shortened goal summary. The classifier needs the original prompt to detect multi-agent signals.",
 		config.askWhenAmbiguous !== false
 			? "If a request is ambiguous and tracking would add overhead, ask the user before creating a long task."
 			: "When ambiguous, use your best judgment without asking.",
@@ -599,7 +744,7 @@ export function buildTaskRoutingSystemPrompt(cwd: string, userPrompt: string): s
 		"- answer_directly: answer without long_task unless the user explicitly asks to track it.",
 		"- use_long_task: use or create a long_task, reusing an active matching task first.",
 		"- plan_multi_agent: keep the lead agent in control; create or reuse a long_task and plan worker roles, but do not spawn workers yet.",
-		"Worker plan hints are planning guidance only; do not spawn workers unless a later implementation explicitly supports worker execution.",
+		"Worker plan hints are planning guidance. Use the worker_execute tool to run researcher and reviewer workers. Coder, tester, and docWriter workers are available for later phases.",
 		"Step drafts are suggestions only; do not add them to long_task unless the user asks to track or continue the task.",
 		activeTaskLines.length > 0 ? `Active long tasks:\n${activeTaskLines.join("\n")}` : "Active long tasks: none.",
 		workerLines.length > 0 ? `Available worker hints:\n${workerLines.join("\n")}` : undefined,
@@ -639,6 +784,7 @@ function executeLongTaskAction(
 	params: {
 		action: "create" | "list" | "show" | "add_step" | "set_task" | "set_step" | "add_artifact" | "resume" | "suggest_steps" | "add_suggested_steps";
 		goal?: string;
+		sourcePrompt?: string;
 		taskId?: string;
 		title?: string;
 		stepId?: string;
@@ -649,14 +795,16 @@ function executeLongTaskAction(
 		expectedOutput?: string;
 		allowedScope?: string[];
 		artifact?: string;
+		stepArtifacts?: string[];
+		notes?: string;
 	},
 ): { text: string; details: unknown } {
 	if (!isEnabled(cwd)) {
 		throw new Error("Long-task runner is disabled by .pi/task-router.config.json");
 	}
 	if (params.action === "suggest_steps") {
-		const goal = (params.goal ?? "").trim();
-		const drafts = buildAgentStepDrafts(goal);
+		const prompt = (params.sourcePrompt ?? params.goal ?? "").trim();
+		const drafts = buildAgentStepDrafts(prompt);
 		if (drafts.length === 0) {
 			return { text: "No multi-agent step drafts suggested for this goal.", details: { drafts: [] } };
 		}
@@ -671,8 +819,8 @@ function executeLongTaskAction(
 	}
 	if (params.action === "add_suggested_steps") {
 		const task = readTask(cwd, requireString(params.taskId, "taskId"));
-		const goal = (params.goal || task.goal).trim();
-		const drafts = buildAgentStepDrafts(goal);
+		const prompt = (params.sourcePrompt ?? task.originalPrompt ?? params.goal ?? task.goal).trim();
+		const drafts = buildAgentStepDrafts(prompt);
 		const results: Array<{ draft: typeof drafts[number]; stepId: string; reused: boolean }> = [];
 		for (const draft of drafts) {
 			const result = addOrReuseTaskStep(cwd, task.id, draft.title, {
@@ -696,7 +844,7 @@ function executeLongTaskAction(
 				details: { reused: true, task: matchingTask },
 			};
 		}
-		const task = createLongTask(cwd, goal);
+		const task = createLongTask(cwd, goal, undefined, params.sourcePrompt);
 		return { text: `Created long task\n${formatTaskSummary(task)}`, details: task };
 	}
 	if (params.action === "list") {
@@ -740,6 +888,8 @@ function executeLongTaskAction(
 			requireString(params.stepId, "stepId"),
 			requireString(params.status, "status") as StepStatus,
 			params.message,
+			params.stepArtifacts,
+			params.notes,
 		);
 		return { text: `Updated step\n${formatTaskSummary(task)}`, details: task };
 	}
@@ -770,7 +920,21 @@ async function handleTaskCommand(args: string, ctx: ExtensionCommandContext): Pr
 		}
 		if (parsed.action === "list") {
 			const tasks = listTasks(ctx.cwd);
-			notify(ctx, tasks.length === 0 ? "No long tasks found." : tasks.map(formatTaskSummary).join("\n\n"));
+			if (tasks.length === 0) {
+				notify(ctx, "No long tasks found.");
+				return;
+			}
+			const active = tasks.filter(isActiveTask);
+			const done = tasks.filter((t) => !isActiveTask(t));
+			const parts: string[] = [];
+			if (active.length > 0) {
+				parts.push(`Active (${active.length}):\n${active.map(formatTaskSummary).join("\n\n")}`);
+			}
+			if (done.length > 0) {
+				const recent = done.slice(0, 5);
+				parts.push(`Recently completed (showing ${recent.length} of ${done.length}):\n${recent.map(formatTaskSummary).join("\n\n")}`);
+			}
+			notify(ctx, parts.join("\n\n"));
 			return;
 		}
 		if (parsed.action === "show") {
@@ -811,7 +975,7 @@ async function handleTaskCommand(args: string, ctx: ExtensionCommandContext): Pr
 			if (!taskId) throw new Error("Task id is required");
 			if (!stepId) throw new Error("Step id is required");
 			if (!status) throw new Error("Step status is required");
-			const task = updateStepStatus(ctx.cwd, taskId, stepId, status as StepStatus, messageParts.join(" "));
+			const task = updateStepStatus(ctx.cwd, taskId, stepId, status as StepStatus, messageParts.join(" ") || undefined);
 			notify(ctx, `Updated step\n${formatTaskSummary(task)}`);
 			return;
 		}
@@ -853,8 +1017,8 @@ export default function longTaskRunnerExtension(pi: ExtensionAPI) {
 			"Before create or add_step, inspect active task state and reuse an existing matching task or step instead of duplicating it.",
 			"Use long_task with action create before tracking a new long-running task, then add_step and set_step as progress is made.",
 			"Use long_task add_artifact to attach important files, URLs, notes, or outputs to the task record.",
-			"Use long_task suggest_steps to preview step drafts for a goal without writing anything.",
-			"Use long_task add_suggested_steps to persist suggested step drafts into a task, reusing existing steps when they match.",
+			"Use long_task suggest_steps to preview step drafts for a goal without writing anything. Always pass the original user request as sourcePrompt, not a shortened goal summary.",
+			"Use long_task add_suggested_steps to persist suggested step drafts into a task, reusing existing steps when they match. Always pass the original user request as sourcePrompt, not a shortened goal summary.",
 		],
 		parameters: LongTaskToolParams,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
