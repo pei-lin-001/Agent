@@ -16,6 +16,9 @@ import {
 	readConfig,
 } from "./long-task-runner.js";
 import { execSync } from "node:child_process";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { homedir } from "node:os";
 
 // ── 类型 ──────────────────────────────────────────────────────────
 

@@ -17,6 +17,9 @@ import {
 	addTaskStep,
 } from "./long-task-runner.js";
 import { execSync } from "node:child_process";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { homedir } from "node:os";
 
 // ── 配置 ─────────────────────────────────────────────────────────
 
@@ -268,10 +271,10 @@ async function escalateToRepair(
 
 function getOllamaKey(): string {
 	try {
-		return execSync(
-			'security find-generic-password -a "$USER" -s "OLLAMA_API_KEY" -w 2>/dev/null',
-			{ timeout: 3000 },
-		).toString().trim();
+		const authPath = join(homedir(), ".pi", "agent", "auth.json");
+		const authRaw = readFileSync(authPath, "utf-8");
+		const auth = JSON.parse(authRaw) as Record<string, { key?: string }>;
+		return auth["ollama-cloud"]?.key ?? "";
 	} catch {
 		return "";
 	}
