@@ -379,3 +379,8 @@ export function getSessionsDir(): string {
 export function getDebugLogPath(): string {
 	return join(getAgentDir(), `${APP_NAME}-debug.log`);
 }
+
+/** Get path to crash log file */
+export function getCrashLogPath(): string {
+	return join(getAgentDir(), `${APP_NAME}-crash.log`);
+}

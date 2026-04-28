@@ -4,19 +4,26 @@ import { createAgentSession, SessionManager } from "@mariozechner/pi-coding-agen
 import type { AgentSession } from "@mariozechner/pi-coding-agent";
 import { Type } from "typebox";
 import { StringEnum } from "@mariozechner/pi-ai";
-import { updateStepStatus } from "./long-task-runner.js";
+import type { ImageContent } from "@mariozechner/pi-ai";
+import { updateStepStatus, readConfig } from "./long-task-runner.js";
+import type { TaskRouterConfig } from "./long-task-runner.js";
+import type { Model, ThinkingLevel } from "@mariozechner/pi-ai";
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
-type WorkerRole = "researcher" | "coder" | "tester" | "reviewer" | "docWriter";
+type WorkerRole = "researcher" | "coder" | "tester" | "reviewer" | "docWriter" | "imageReviewer";
 
 export interface WorkerExecutionOptions {
 	goal: string;
 	worker: WorkerRole;
 	context?: string;
+	images?: ImageContent[];
 	taskId?: string;
 	stepId?: string;
 	allowedScope?: string[];
+	/** Optional model override resolved from task-router config */
+	model?: Model<any>;
+	thinkingLevel?: ThinkingLevel;
 }
 
 export interface WorkerExecutionResult {
@@ -53,15 +60,18 @@ export function buildWorkerSystemInstructions(role: WorkerRole, allowedScope?: s
 
 	const roleRules: Record<WorkerRole, string[]> = {
 		researcher: [
-			"ROLE: READ-ONLY RESEARCHER.",
-			"Use read, grep, find, and ls to explore the codebase.",
+			"ROLE: RESEARCHER.",
+			"You have access to read, grep, find, ls, bash (including curl for web search), edit, and write.",
+			"Use bash with curl to search the internet for real, verifiable data. Do not fabricate data from model knowledge.",
+			"When presenting data, cite your actual sources (URLs you visited).",
 			"Output: findings, relevant files, risks, and assumptions.",
 			"Format your output with clear sections: ## Findings, ## Relevant Files, ## Risks, ## Assumptions.",
 		],
 		reviewer: [
-			"ROLE: READ-ONLY REVIEWER.",
-			"Use read, grep, find, and ls to inspect code and diffs.",
-			"Review for: regressions, test coverage gaps, code quality issues, security concerns.",
+			"ROLE: REVIEWER.",
+			"You have access to read, grep, find, ls, bash (including curl), edit, and write.",
+			"Review code and documents for: regressions, test coverage gaps, code quality issues, design flaws.",
+			"Be critical about aesthetics and quality, not just correctness. If a chart is ugly, say so.",
 			"Output: findings ordered by severity (critical, high, medium, low).",
 			"Format your output with clear sections: ## Critical, ## High, ## Medium, ## Low.",
 		],
@@ -78,18 +88,28 @@ export function buildWorkerSystemInstructions(role: WorkerRole, allowedScope?: s
 		],
 		tester: [
 			"ROLE: VALIDATION TESTER.",
-			"You may use bash to run test commands. You may read test results and source files.",
-			"Do NOT edit any files.",
-			"Run the specified test commands and report results.",
+			"You have access to read, bash, edit, and write.",
+			"Run the specified test commands and report results truthfully.",
 			"Output: commands run, pass/fail status, and failure details if any.",
 			"Format with ## Commands Run and ## Results sections.",
 		],
 		docWriter: [
 			"ROLE: DOCUMENTATION WRITER.",
-			"You may edit documentation files only (markdown, README, docs).",
+			"You have access to read, edit, write, and bash.",
+			"Write clear, well-structured Chinese documentation.",
+			"Use bash to verify file integrity and formatting.",
 			"Do NOT edit source code.",
 			"If no documentation changes are needed, explain why.",
 			"Output: changed doc file paths, or explanation of why no docs changes were needed.",
+		],
+		imageReviewer: [
+			"ROLE: IMAGE REVIEWER (multimodal).",
+			"You receive image attachments and a review goal. Analyze the images visually using your multimodal capabilities.",
+			"For chart/UI reviews: check colors, typography, layout, readability, and data accuracy.",
+			"For aesthetic reviews: score each dimension (1-10) — color scheme, layout, font/label clarity, data readability, overall professionalism.",
+			"Be strict and critical — point out specific flaws with pixel-level observations.",
+			"Output: structured review with scores, observations, and concrete improvement suggestions.",
+			"Format with ## Review Scores and ## Issues Found and ## Improvement Suggestions sections.",
 		],
 	};
 
@@ -97,17 +117,52 @@ export function buildWorkerSystemInstructions(role: WorkerRole, allowedScope?: s
 }
 
 export function getToolsForRole(role: WorkerRole): string[] {
-	switch (role) {
-		case "researcher":
-		case "reviewer":
-			return ["read", "grep", "find", "ls"];
-		case "coder":
-			return ["read", "bash", "edit", "write"];
-		case "tester":
-			return ["read", "bash"];
-		case "docWriter":
-			return ["read", "edit", "write"];
+	// All workers get full tool access: reasoning without execution capability is meaningless.
+	// The scope constraint is enforced via allowedScope (for coder/docWriter) and
+	// role-based behavioral instructions, not tool restrictions.
+	return ["read", "bash", "edit", "write", "ls", "grep", "find"];
+}
+
+// ── Model Policy Resolution ──────────────────────────────────────────────
+
+/** Mapping from ThinkingLevel string to the enum type */
+const VALID_THINKING_LEVELS = new Set<string>(["minimal", "low", "medium", "high", "xhigh"]);
+
+/**
+ * Resolve a worker role to a specific model + thinkingLevel from the task-router config.
+ * Returns undefined if no policy is configured or the model cannot be found in the registry.
+ */
+export function resolveWorkerModel(
+	cwd: string,
+	workerRole: WorkerRole,
+	modelRegistry: { find: (provider: string, modelId: string) => Model<any> | undefined },
+): { model: Model<any>; thinkingLevel?: ThinkingLevel } | undefined {
+	const config = readConfig(cwd);
+
+	// Find the worker's configured modelPolicy name
+	const workerConfig = config.workers?.[workerRole];
+	const policyName = workerConfig?.modelPolicy;
+	if (!policyName) {
+		return undefined;
 	}
+
+	// Look up the policy definition
+	const policy = config.modelPolicies?.[policyName];
+	if (!policy || !policy.provider || !policy.model) {
+		return undefined;
+	}
+
+	// Resolve via the model registry
+	const resolved = modelRegistry.find(policy.provider, policy.model);
+	if (!resolved) {
+		return undefined;
+	}
+
+	const thinkingLevel = policy.thinkingLevel && VALID_THINKING_LEVELS.has(policy.thinkingLevel)
+		? (policy.thinkingLevel as ThinkingLevel)
+		: undefined;
+
+	return { model: resolved, thinkingLevel };
 }
 
 // ── Core Execution ─────────────────────────────────────────────────────────
@@ -135,15 +190,24 @@ export async function executeWorker(
 			session = result.session;
 			disposeSession = result.dispose;
 		} else {
-			const result = await createAgentSession({
+			// Build session options — include model override if provided by config
+			const sessionOptions: Parameters<typeof createAgentSession>[0] = {
 				cwd,
 				tools,
 				sessionManager: SessionManager.inMemory(cwd),
-			});
+			};
+			if (options.model) {
+				sessionOptions.model = options.model;
+				sessionOptions.thinkingLevel = options.thinkingLevel;
+			}
+			const result = await createAgentSession(sessionOptions);
 			session = result.session;
 		}
 
-		await session.prompt(`${systemInstructions}\n\n${userPrompt}`);
+		await session.prompt(
+			`${systemInstructions}\n\n${userPrompt}`,
+			options.images ? { images: options.images } : undefined,
+		);
 
 		const output = session.messages
 			.filter((m) => m.role === "assistant")
@@ -335,7 +399,7 @@ export async function executeMultipleWorkers(
 // ── Tool Definition ────────────────────────────────────────────────────────
 
 const WorkerExecuteParams = Type.Object({
-	worker: StringEnum(["researcher", "coder", "tester", "reviewer", "docWriter"] as const, {
+	worker: StringEnum(["researcher", "coder", "tester", "reviewer", "docWriter", "imageReviewer"] as const, {
 		description: "Worker role to execute as.",
 	}),
 	goal: Type.String({ description: "Goal for the worker step." }),
@@ -346,6 +410,9 @@ const WorkerExecuteParams = Type.Object({
 	stepId: Type.Optional(Type.String({ description: "Step id to update on completion." })),
 	allowedScope: Type.Optional(
 		Type.Array(Type.String(), { description: "Allowed file scope for coder worker." }),
+	),
+	images: Type.Optional(
+		Type.Array(Type.Any(), { description: "Base64-encoded images for multimodal workers (imageReviewer)." }),
 	),
 });
 
@@ -364,10 +431,13 @@ export default function workerExecutorExtension(pi: ExtensionAPI) {
 			"Call reviewer for code review, diff analysis, and test coverage assessment.",
 			"Call coder for scoped implementation within allowedScope.",
 			"Call tester to run validation commands and report results.",
+			"Call imageReviewer to visually inspect images/charts with multimodal model (requires kimi-2.6). Pass image file paths as base64 in the images parameter.",
 			"Always set taskId and stepId so results are persisted to the long task record.",
 			"Provide focused context (relevant files, prior step outputs) rather than full conversation history.",
 			"Wait for worker output before proceeding to the next step. Workers run synchronously.",
-			"Researcher and reviewer are read-only. They cannot modify files.",
+			"All workers have full tool access (read, bash, edit, write, ls, grep, find). They are constrained by role-based instructions, not tool restrictions.",
+			"Researcher can use bash+curl to search the internet for real data. Do not fabricate data.",
+			"Reviewer should be critical about quality and aesthetics, not just correctness.",
 		],
 		parameters: WorkerExecuteParams,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -379,13 +449,19 @@ export default function workerExecutorExtension(pi: ExtensionAPI) {
 				};
 			}
 
+			// Resolve worker-specific model from task-router config
+			const workerOverride = resolveWorkerModel(ctx.cwd, params.worker as WorkerRole, ctx.modelRegistry);
+
 			const result = await executeWorker(ctx.cwd, {
 				goal: params.goal,
 				worker: params.worker as WorkerRole,
 				context: params.context,
+				images: params.images as ImageContent[] | undefined,
 				taskId: params.taskId,
 				stepId: params.stepId,
 				allowedScope: params.allowedScope,
+				model: workerOverride?.model,
+				thinkingLevel: workerOverride?.thinkingLevel,
 			});
 
 			if (result.error) {
@@ -433,13 +509,14 @@ export default function workerExecutorExtension(pi: ExtensionAPI) {
 		parameters: Type.Object({
 			jobs: Type.Array(
 				Type.Object({
-					worker: StringEnum(["researcher", "coder", "tester", "reviewer", "docWriter"] as const, {
+					worker: StringEnum(["researcher", "coder", "tester", "reviewer", "docWriter", "imageReviewer"] as const, {
 						description: "Worker role.",
 					}),
 					goal: Type.String({ description: "Goal for this worker." }),
 					context: Type.Optional(Type.String({ description: "Optional context." })),
 					stepId: Type.Optional(Type.String({ description: "Optional step id." })),
 					allowedScope: Type.Optional(Type.Array(Type.String(), { description: "Optional allowed scope." })),
+				images: Type.Optional(Type.Array(Type.Any(), { description: "Optional images for multimodal review." })),
 				}),
 				{ description: "Array of worker jobs to execute." },
 			),
@@ -456,13 +533,18 @@ export default function workerExecutorExtension(pi: ExtensionAPI) {
 
 			const { results, summary } = await executeMultipleWorkers(
 				ctx.cwd,
-				params.jobs.map((j) => ({
-					goal: j.goal,
-					worker: j.worker as WorkerRole,
-					context: j.context,
-					stepId: j.stepId,
-					allowedScope: j.allowedScope,
-				})),
+				params.jobs.map((j) => {
+					const workerOverride = resolveWorkerModel(ctx.cwd, j.worker as WorkerRole, ctx.modelRegistry);
+					return {
+						goal: j.goal,
+						worker: j.worker as WorkerRole,
+						context: j.context,
+						images: j.images as ImageContent[] | undefined,						stepId: j.stepId,
+						allowedScope: j.allowedScope,
+						model: workerOverride?.model,
+						thinkingLevel: workerOverride?.thinkingLevel,
+					};
+				}),
 				params.taskId,
 			);
 

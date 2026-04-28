@@ -9,7 +9,7 @@ import { buildAgentStepDrafts, recommendAgentDispatch } from "./multi-agent-disp
 type TaskStatus = "pending" | "running" | "blocked" | "completed" | "failed" | "cancelled";
 type StepStatus = "pending" | "running" | "completed" | "failed" | "skipped" | "blocked";
 
-interface TaskRouterConfig {
+export interface TaskRouterConfig {
 	enabled?: boolean;
 	defaultMode?: "immediate" | "long-task";
 	askWhenAmbiguous?: boolean;
@@ -150,7 +150,7 @@ function parseConfig(cwd: string): TaskRouterConfig {
 	}
 }
 
-function readConfig(cwd: string): TaskRouterConfig {
+export function readConfig(cwd: string): TaskRouterConfig {
 	return { ...DEFAULT_CONFIG, ...parseConfig(cwd) };
 }
 

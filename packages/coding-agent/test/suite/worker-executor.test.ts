@@ -1,4 +1,4 @@
-import { mkdirSync, rmSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentSession } from "@mariozechner/pi-coding-agent";
@@ -12,6 +12,7 @@ import workerExecutorExtension, {
 	extractReferences,
 	getToolsForRole,
 	isInScope,
+	resolveWorkerModel,
 	setSessionFactory,
 } from "../../../../.pi/extensions/worker-executor.js";
 
@@ -124,15 +125,16 @@ describe("worker executor", () => {
 
 	it("builds researcher-specific system instructions", () => {
 		const instructions = buildWorkerSystemInstructions("researcher");
-		expect(instructions).toContain("READ-ONLY RESEARCHER");
-		expect(instructions).toContain("Use read, grep, find, and ls");
+		expect(instructions).toContain("ROLE: RESEARCHER");
+		expect(instructions).toContain("including curl for web search");
 		expect(instructions).toContain("## Findings");
 		expect(instructions).toContain("## Risks");
 	});
 
 	it("builds reviewer-specific system instructions", () => {
 		const instructions = buildWorkerSystemInstructions("reviewer");
-		expect(instructions).toContain("READ-ONLY REVIEWER");
+		expect(instructions).toContain("ROLE: REVIEWER");
+		expect(instructions).toContain("aesthetics");
 		expect(instructions).toContain("## Critical");
 		expect(instructions).toContain("## High");
 	});
@@ -151,50 +153,49 @@ describe("worker executor", () => {
 	it("builds tester-specific system instructions", () => {
 		const instructions = buildWorkerSystemInstructions("tester");
 		expect(instructions).toContain("VALIDATION TESTER");
-		expect(instructions).toContain("Do NOT edit any files");
+		expect(instructions).toContain("edit, and write");
 	});
 
 	it("builds docWriter-specific system instructions", () => {
 		const instructions = buildWorkerSystemInstructions("docWriter");
 		expect(instructions).toContain("DOCUMENTATION WRITER");
-		expect(instructions).toContain("Do NOT edit source code");
+		expect(instructions).toContain("Chinese documentation");
 	});
 
-	// ── getToolsForRole ────────────────────────────────────────────────
+	it("builds imageReviewer-specific system instructions", () => {
+		const instructions = buildWorkerSystemInstructions("imageReviewer");
+		expect(instructions).toContain("IMAGE REVIEWER");
+		expect(instructions).toContain("multimodal");
+		expect(instructions).toContain("pixel-level");
+	});
 
-	it("returns read-only tools for researcher", () => {
+	// ── getToolsForRole (all workers have full tool access) ────
+
+	it("returns full tools for researcher", () => {
 		const tools = getToolsForRole("researcher");
-		expect(tools).toEqual(["read", "grep", "find", "ls"]);
-		expect(tools).not.toContain("bash");
-		expect(tools).not.toContain("edit");
+		expect(tools).toContain("bash");
+		expect(tools).toContain("edit");
 	});
 
-	it("returns read-only tools for reviewer", () => {
+	it("returns full tools for reviewer", () => {
 		const tools = getToolsForRole("reviewer");
-		expect(tools).toEqual(["read", "grep", "find", "ls"]);
+		expect(tools).toContain("bash");
 	});
 
-	it("returns coding tools for coder", () => {
+	it("returns full tools for coder", () => {
 		const tools = getToolsForRole("coder");
-		expect(tools).toContain("read");
-		expect(tools).toContain("bash");
-		expect(tools).toContain("edit");
-		expect(tools).toContain("write");
+		expect(tools).toContain("ls");
+		expect(tools).toContain("grep");
 	});
 
-	it("returns bash and read for tester", () => {
+	it("returns full tools for tester", () => {
 		const tools = getToolsForRole("tester");
-		expect(tools).toContain("read");
-		expect(tools).toContain("bash");
-		expect(tools).not.toContain("edit");
+		expect(tools).toContain("edit");
 	});
 
-	it("returns read+edit+write for docWriter", () => {
+	it("returns full tools for docWriter", () => {
 		const tools = getToolsForRole("docWriter");
-		expect(tools).toContain("read");
-		expect(tools).toContain("edit");
-		expect(tools).toContain("write");
-		expect(tools).not.toContain("bash");
+		expect(tools).toContain("bash");
 	});
 
 	// ── extractReferences ──────────────────────────────────────────────
@@ -282,7 +283,7 @@ describe("worker executor", () => {
 
 		expect(result.output).toContain("Research findings");
 		expect(result.error).toBeUndefined();
-		expect(capturedInstructions).toContain("READ-ONLY RESEARCHER");
+		expect(capturedInstructions).toContain("ROLE: RESEARCHER");
 	});
 
 	it("executeWorker returns error on session failure", async () => {
@@ -544,5 +545,141 @@ describe("worker executor", () => {
 		expect(results[1]!.output).toBe("researcher result");
 		expect(summary).toContain("[coder] Write change");
 		expect(summary).toContain("[researcher] Research context");
+	});
+});
+
+// ── resolveWorkerModel ────────────────────────────────────────────────────
+
+describe("resolveWorkerModel", () => {
+	const fakeModel = { id: "test-model", provider: "test-provider", name: "Test Model" } as any;
+	const fakeRegistry = {
+		find: (provider: string, modelId: string) => {
+			if (provider === "test-provider" && modelId === "test-model") return fakeModel;
+			return undefined;
+		},
+	};
+
+	it("returns undefined when no config file exists", () => {
+		const tmpDir = join(tmpdir(), `pi-resolve-model-no-config-${Date.now()}`);
+		try {
+			const result = resolveWorkerModel(tmpDir, "researcher", fakeRegistry);
+			expect(result).toBeUndefined();
+		} finally {
+			rmSync(tmpDir, { recursive: true, force: true });
+		}
+	});
+
+	it("returns undefined when worker has no modelPolicy", () => {
+		const tmpDir = join(tmpdir(), `pi-resolve-model-no-policy-${Date.now()}`);
+		mkdirSync(join(tmpDir, ".pi"), { recursive: true });
+		try {
+			// Config with no modelPolicy on workers
+			writeFileSync(
+				join(tmpDir, ".pi", "task-router.config.json"),
+				JSON.stringify({
+					workers: { researcher: { enabled: true } },
+					modelPolicies: { coding: { provider: "test-provider", model: "test-model" } },
+				}),
+			);
+			const result = resolveWorkerModel(tmpDir, "researcher", fakeRegistry);
+			expect(result).toBeUndefined();
+		} finally {
+			rmSync(tmpDir, { recursive: true, force: true });
+		}
+	});
+
+	it("returns undefined when modelPolicy references a policy with null provider/model", () => {
+		const tmpDir = join(tmpdir(), `pi-resolve-model-null-values-${Date.now()}`);
+		mkdirSync(join(tmpDir, ".pi"), { recursive: true });
+		try {
+			writeFileSync(
+				join(tmpDir, ".pi", "task-router.config.json"),
+				JSON.stringify({
+					workers: { researcher: { modelPolicy: "longContext" } },
+					modelPolicies: { longContext: { provider: null, model: null } },
+				}),
+			);
+			const result = resolveWorkerModel(tmpDir, "researcher", fakeRegistry);
+			expect(result).toBeUndefined();
+		} finally {
+			rmSync(tmpDir, { recursive: true, force: true });
+		}
+	});
+
+	it("returns undefined when model is not found in registry", () => {
+		const tmpDir = join(tmpdir(), `pi-resolve-model-not-found-${Date.now()}`);
+		mkdirSync(join(tmpDir, ".pi"), { recursive: true });
+		try {
+			writeFileSync(
+				join(tmpDir, ".pi", "task-router.config.json"),
+				JSON.stringify({
+					workers: { researcher: { modelPolicy: "coding" } },
+					modelPolicies: { coding: { provider: "nonexistent", model: "nope" } },
+				}),
+			);
+			const result = resolveWorkerModel(tmpDir, "researcher", fakeRegistry);
+			expect(result).toBeUndefined();
+		} finally {
+			rmSync(tmpDir, { recursive: true, force: true });
+		}
+	});
+
+	it("resolves model from config and registry", () => {
+		const tmpDir = join(tmpdir(), `pi-resolve-model-success-${Date.now()}`);
+		mkdirSync(join(tmpDir, ".pi"), { recursive: true });
+		try {
+			writeFileSync(
+				join(tmpDir, ".pi", "task-router.config.json"),
+				JSON.stringify({
+					workers: { researcher: { modelPolicy: "coding" } },
+					modelPolicies: { coding: { provider: "test-provider", model: "test-model", thinkingLevel: "high" } },
+				}),
+			);
+			const result = resolveWorkerModel(tmpDir, "researcher", fakeRegistry);
+			expect(result).toBeDefined();
+			expect(result!.model).toBe(fakeModel);
+			expect(result!.thinkingLevel).toBe("high");
+		} finally {
+			rmSync(tmpDir, { recursive: true, force: true });
+		}
+	});
+
+	it("resolves model without thinkingLevel when not specified", () => {
+		const tmpDir = join(tmpdir(), `pi-resolve-model-no-thinking-${Date.now()}`);
+		mkdirSync(join(tmpDir, ".pi"), { recursive: true });
+		try {
+			writeFileSync(
+				join(tmpDir, ".pi", "task-router.config.json"),
+				JSON.stringify({
+					workers: { tester: { modelPolicy: "cheap" } },
+					modelPolicies: { cheap: { provider: "test-provider", model: "test-model" } },
+				}),
+			);
+			const result = resolveWorkerModel(tmpDir, "tester", fakeRegistry);
+			expect(result).toBeDefined();
+			expect(result!.model).toBe(fakeModel);
+			expect(result!.thinkingLevel).toBeUndefined();
+		} finally {
+			rmSync(tmpDir, { recursive: true, force: true });
+		}
+	});
+
+	it("ignores invalid thinkingLevel values", () => {
+		const tmpDir = join(tmpdir(), `pi-resolve-model-bad-thinking-${Date.now()}`);
+		mkdirSync(join(tmpDir, ".pi"), { recursive: true });
+		try {
+			writeFileSync(
+				join(tmpDir, ".pi", "task-router.config.json"),
+				JSON.stringify({
+					workers: { coder: { modelPolicy: "coding" } },
+					modelPolicies: { coding: { provider: "test-provider", model: "test-model", thinkingLevel: "ultra" } },
+				}),
+			);
+			const result = resolveWorkerModel(tmpDir, "coder", fakeRegistry);
+			expect(result).toBeDefined();
+			expect(result!.thinkingLevel).toBeUndefined();
+		} finally {
+			rmSync(tmpDir, { recursive: true, force: true });
+		}
 	});
 });

@@ -54,19 +54,19 @@
 			"allowParallel": true
 		},
 		"coder": {
-			"enabled": false,
+			"enabled": true,
 			"permission": "scoped-write",
 			"modelPolicy": "coding",
 			"allowParallel": false
 		},
 		"tester": {
-			"enabled": false,
+			"enabled": true,
 			"permission": "validation-only",
-			"modelPolicy": "coding",
+			"modelPolicy": "cheapBatch",
 			"allowParallel": false
 		},
 		"docWriter": {
-			"enabled": false,
+			"enabled": true,
 			"permission": "scoped-write",
 			"modelPolicy": "chineseWriting",
 			"allowParallel": false

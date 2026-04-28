@@ -22,6 +22,8 @@ interface MemoryConfig {
 	maxTurnChars: number;
 	maxMemoryChars: number;
 	debug: boolean;
+	/** Half-life in days for time-based score decay. 0 = no decay. Default: 30. */
+	decayHalfLifeDays: number;
 }
 
 interface MemoryItem {
@@ -30,6 +32,8 @@ interface MemoryItem {
 	text?: string;
 	score?: number;
 	metadata?: Record<string, unknown>;
+	created_at?: string;
+	updated_at?: string;
 }
 
 interface MemorySearchResponse {
@@ -40,7 +44,7 @@ interface MemorySearchResponse {
 
 type MemoryRole = "user" | "assistant";
 
-interface MemoryMessage {
+export interface MemoryMessage {
 	role: MemoryRole;
 	content: string;
 }
@@ -56,12 +60,13 @@ const DEFAULT_CONFIG: MemoryConfig = {
 	userId: process.env.MEM0_USER_ID ?? userInfo().username,
 	agentId: process.env.MEM0_AGENT_ID ?? "personal-agent",
 	topK: 5,
-	requestTimeoutMs: 3000,
+	requestTimeoutMs: 10_000,
 	failureCooldownMs: 60_000,
 	minPromptChars: 12,
 	maxTurnChars: 12_000,
 	maxMemoryChars: 1200,
 	debug: false,
+	decayHalfLifeDays: 30,
 };
 
 function readConfigFile(configPath: string): { exists: boolean; config: Partial<MemoryConfig> } {
@@ -160,13 +165,17 @@ function isAssistantMessage(message: unknown): message is AssistantMessage {
 	return (message as { role?: unknown }).role === "assistant";
 }
 
+// ── Network helpers ─────────────────────────────────────────────────────────
+
 async function fetchJson(
 	config: MemoryConfig,
 	url: string,
 	body: Record<string, unknown>,
+	method: string = "POST",
+	timeoutMs?: number,
 ): Promise<unknown> {
 	const controller = new AbortController();
-	const timeout = setTimeout(() => controller.abort(), config.requestTimeoutMs);
+	const timeout = setTimeout(() => controller.abort(), timeoutMs ?? config.requestTimeoutMs);
 	const headers: Record<string, string> = { "content-type": "application/json" };
 	const apiKey = resolveApiKey(config);
 	if (apiKey) {
@@ -174,9 +183,9 @@ async function fetchJson(
 	}
 	try {
 		const response = await fetch(url, {
-			method: "POST",
+			method,
 			headers,
-			body: JSON.stringify(body),
+			body: method !== "DELETE" && method !== "GET" ? JSON.stringify(body) : undefined,
 			signal: controller.signal,
 		});
 		if (!response.ok) {
@@ -187,6 +196,30 @@ async function fetchJson(
 		clearTimeout(timeout);
 	}
 }
+
+async function fetchDelete(config: MemoryConfig, url: string): Promise<void> {
+	const controller = new AbortController();
+	const timeout = setTimeout(() => controller.abort(), config.requestTimeoutMs);
+	const headers: Record<string, string> = {};
+	const apiKey = resolveApiKey(config);
+	if (apiKey) {
+		headers[config.apiKeyHeader] = apiKey;
+	}
+	try {
+		const response = await fetch(url, {
+			method: "DELETE",
+			headers,
+			signal: controller.signal,
+		});
+		if (!response.ok) {
+			throw new Error(`mem0 delete failed: ${response.status} ${response.statusText}`);
+		}
+	} finally {
+		clearTimeout(timeout);
+	}
+}
+
+// ── Response normalization ─────────────────────────────────────────────────
 
 function normalizeSearchResponse(response: unknown): MemoryItem[] {
 	if (Array.isArray(response)) {
@@ -205,6 +238,11 @@ function normalizeSearchResponse(response: unknown): MemoryItem[] {
 		if (Array.isArray(value.data.memories)) return value.data.memories;
 	}
 	return [];
+}
+
+function normalizeAddResponse(response: unknown): string[] {
+	const items = normalizeSearchResponse(response);
+	return items.map((item) => item.id).filter((id): id is string => !!id);
 }
 
 function memoryText(memory: MemoryItem): string | undefined {
@@ -236,6 +274,16 @@ function createMemoryBody(config: MemoryConfig, extra: Record<string, unknown>):
 	};
 }
 
+// ── Extension ──────────────────────────────────────────────────────────────
+
+const DEDUP_SEED_QUERIES = [
+	"multi-agent orchestrator implementation task dispatcher",
+	"project status step completed",
+	"memory system mem0 cleanup stale",
+	"Ollama Cloud model provider",
+	"personal agent extension worker",
+];
+
 export default function mem0MemoryExtension(pi: ExtensionAPI) {
 	let config: MemoryConfig | undefined;
 	let unavailableUntil = 0;
@@ -258,6 +306,25 @@ export default function mem0MemoryExtension(pi: ExtensionAPI) {
 		}
 	};
 
+	/** Apply time-based score decay. Score decays exponentially based on memory age.
+	 *  A memory created `halfLife` days ago has its score multiplied by 0.5.
+	 *  decay_factor = 0.5 ^ (age_days / halfLife_days)
+	 */
+	const applyDecay = (items: MemoryItem[], halfLifeDays: number): MemoryItem[] => {
+		if (halfLifeDays <= 0) return items;
+		const now = Date.now();
+		const halfLifeMs = halfLifeDays * 24 * 60 * 60 * 1000;
+		return items.map((item) => {
+			if (item.score === undefined || item.score === null || !item.created_at) return item;
+			const createdMs = new Date(item.created_at).getTime();
+			if (isNaN(createdMs)) return item;
+			const ageMs = now - createdMs;
+			if (ageMs <= 0) return item;
+			const decayFactor = Math.pow(0.5, ageMs / halfLifeMs);
+			return { ...item, score: item.score * decayFactor };
+		});
+	};
+
 	const searchMemories = async (query: string): Promise<MemoryItem[]> => {
 		if (!config || !isAvailable()) return [];
 		const response = await fetchJson(
@@ -269,32 +336,175 @@ export default function mem0MemoryExtension(pi: ExtensionAPI) {
 				top_k: config.topK,
 			}),
 		);
-		return normalizeSearchResponse(response).slice(0, config.topK);
+		const raw = normalizeSearchResponse(response).slice(0, config.topK);
+		return applyDecay(raw, config.decayHalfLifeDays);
 	};
 
-	const addMemory = async (messages: MemoryMessage[], metadata: Record<string, unknown>): Promise<void> => {
-		if (!config || !isAvailable()) return;
-		await fetchJson(
+	const addMemory = async (messages: MemoryMessage[], metadata: Record<string, unknown>): Promise<string[]> => {
+		if (!config || !isAvailable()) return [];
+		// mem0 add triggers LLM fact extraction — needs longer timeout
+		const response = await fetchJson(
 			config,
 			joinUrl(config.baseUrl, config.addPath),
 			createMemoryBody(config, {
 				messages,
 				metadata,
 			}),
+			"POST",
+			60_000,
 		);
+		return normalizeAddResponse(response);
 	};
+
+	const deleteMemory = async (memoryId: string): Promise<void> => {
+		if (!config || !isAvailable()) return;
+		await fetchDelete(config, joinUrl(config.baseUrl, `/memories/${memoryId}`));
+	};
+
+	// ── Per-turn cleanup: after writing, search for same-topic stale entries ──
+
+	const cleanupStaleMemories = async (query: string, newIds: string[]): Promise<void> => {
+		if (!config || !isAvailable() || newIds.length === 0) return;
+		// Brief delay to allow mem0 vector indexing to complete
+		await new Promise((r) => setTimeout(r, 1000));
+		const results = await searchMemories(query);
+		if (results.length <= 1) return;
+
+		const newIdSet = new Set(newIds);
+		// Guard: if the newly added memory isn't in the top results, indexing may not be complete yet
+		const topIds = new Set(results.slice(0, 3).map((r) => r.id));
+		const newInTop = [...newIdSet].some((id) => topIds.has(id));
+		if (!newInTop) return;
+
+		// Delete older entries with high similarity (same topic cluster)
+		const sorted = results
+			.filter((m) => m.id && m.score !== undefined && m.score !== null)
+			.sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+
+		const topScore = sorted[0]?.score ?? 0;
+		// Only cleanup when results clearly cluster
+		if (topScore < 0.6) return;
+
+		// Collect candidates above score threshold
+		const candidates = sorted.filter(
+			(m) => m.id && !newIdSet.has(m.id) && (m.score ?? 0) >= topScore * 0.75,
+		);
+
+		// LLM-assisted dedup: ask mem0 server which candidates are superseded/contradicted
+		const newMemoryText = results.find((m) => m.id && newIdSet.has(m.id))?.memory ?? "";
+
+		async function llmDedup(newText: string, cands: MemoryItem[]): Promise<string[]> {
+			if (!config || !isAvailable() || cands.length === 0) return [];
+			try {
+				const dedupUrl = joinUrl(config.baseUrl, "/dedup");
+				const response = await fetchJson(
+					config,
+					dedupUrl,
+					createMemoryBody(config, {
+						new_memory: newText,
+						candidates: cands.map((m) => ({
+							id: m.id!,
+							text: m.memory ?? m.text ?? "",
+							score: m.score ?? 0,
+						})),
+					}),
+				);
+				if (response && typeof response === "object" && "delete_ids" in (response as Record<string, unknown>)) {
+					return ((response as Record<string, unknown>).delete_ids as string[]).filter((id): id is string => typeof id === "string");
+				}
+				return [];
+			} catch (_e) {
+				logDebug(`LLM dedup failed, falling back to score-based: ${_e instanceof Error ? _e.message : String(_e)}`);
+				return [];
+			}
+		}
+
+		const deleteIds = await llmDedup(newMemoryText, candidates);
+
+		if (deleteIds.length > 0) {
+			// LLM identified specific memories to delete
+			logDebug(`LLM dedup identified ${deleteIds.length} stale memories`);
+			for (const id of deleteIds) {
+				try {
+					await deleteMemory(id);
+					logDebug(`LLM dedup: deleted ${id}`);
+				} catch (_e) {
+					// cleanup failure is non-critical
+				}
+			}
+		} else {
+			// LLM didn't identify any, or call failed: fall back to score-based
+			logDebug(`LLM dedup returned no deletions, using score-based fallback`);
+			for (const mem of candidates) {
+				if (mem.id) {
+					try {
+					await deleteMemory(mem.id);
+					logDebug(`score-based dedup: deleted ${mem.id} (score ${(mem.score ?? 0).toFixed(3)})`);
+				} catch (_e) {
+					// cleanup failure is non-critical
+				}
+				}
+			}
+		}
+	};
+
+	// ── Session-start full dedup: sweep seed queries for stale clusters ──
+
+	const runFullDedup = async (): Promise<void> => {
+		if (!config || !isAvailable()) return;
+		logDebug("full dedup sweep started");
+		let deleted = 0;
+		for (const query of DEDUP_SEED_QUERIES) {
+			try {
+				// Use higher limit for full dedup sweep
+				const response = await fetchJson(
+					config,
+					joinUrl(config.baseUrl, config.searchPath),
+					createMemoryBody(config, { query, limit: 20, top_k: 20 }),
+				);
+				const results = normalizeSearchResponse(response);
+				if (results.length <= 2) continue;
+				const sorted = results
+					.filter((m) => m.id && m.score !== undefined && m.score !== null)
+					.sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+				const topScore = sorted[0]?.score ?? 0;
+				if (topScore < 0.6) continue;
+				for (let i = 1; i < sorted.length; i++) {
+					const mem = sorted[i]!;
+					if ((mem.score ?? 0) >= topScore * 0.75 && mem.id) {
+						await deleteMemory(mem.id);
+						deleted++;
+						logDebug(`full dedup: deleted ${mem.id} (score ${mem.score!.toFixed(3)})`);
+					}
+				}
+			} catch (_e) {
+				// single query failure doesn't stop the sweep
+			}
+		}
+		logDebug(`full dedup sweep finished: ${deleted} deleted`);
+	};
+
+	// ── Lifecycle hooks ──────────────────────────────────────────────────────
 
 	pi.on("session_start", async (_event, ctx) => {
 		config = readConfig(ctx.cwd);
 		unavailableUntil = 0;
 		lastUserText = "";
 		logDebug(`enabled=${config.enabled} baseUrl=${config.baseUrl}`);
+		// Background full dedup: sweep all memories for stale clusters
+		if (config?.enabled) {
+			runFullDedup().catch(() => {});
+		}
 	});
 
 	pi.on("before_agent_start", async (event) => {
 		if (!config || !isAvailable()) {
 			return undefined;
 		}
+
+		// Wait for pending writes to complete before searching, so the next turn
+		// always sees the latest memories from the previous turn.
+		await writeQueue.catch(() => {});
 
 		const query = truncateText(event.prompt, config.maxTurnChars);
 		if (query.length < config.minPromptChars) {
@@ -358,9 +568,25 @@ export default function mem0MemoryExtension(pi: ExtensionAPI) {
 
 		writeQueue = writeQueue
 			.then(() => addMemory(messages, metadata))
+			.then((newIds) => {
+				if (newIds.length > 0) {
+					// Use combined user+assistant query for broader topic coverage
+					const combinedQuery = truncateText(
+						`${lastUserText}\n${assistantText.slice(0, 3000)}`,
+						config?.maxTurnChars ?? DEFAULT_CONFIG.maxTurnChars,
+					);
+					cleanupStaleMemories(combinedQuery, newIds).catch(() => {});
+				}
+			})
 			.catch((error) => {
-				logDebug(`write failed: ${error instanceof Error ? error.message : String(error)}`);
-				markUnavailable();
+				const msg = error instanceof Error ? error.message : String(error);
+				// Timeouts are transient — don't mark unavailable, just log and retry next turn
+				if (msg.includes("aborted") || msg.includes("AbortError") || msg.includes("timeout")) {
+					logDebug(`write timed out (will retry): ${msg}`);
+				} else {
+					logDebug(`write failed: ${msg}`);
+					markUnavailable();
+				}
 			});
 	});
 
