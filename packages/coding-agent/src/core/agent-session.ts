@@ -2964,17 +2964,24 @@ export class AgentSession {
 			}
 
 			if (!hasPostCompactionUsage) {
-				return { tokens: null, contextWindow, percent: null };
+				// No provider-returned usage after compaction — use token estimation instead of showing "?"
+				const fallbackEstimate = estimateContextTokens(this.messages);
+				const fallbackPercent = (fallbackEstimate.tokens / contextWindow) * 100;
+				return { tokens: fallbackEstimate.tokens, contextWindow, percent: fallbackPercent, estimated: true };
 			}
 		}
 
 		const estimate = estimateContextTokens(this.messages);
 		const percent = (estimate.tokens / contextWindow) * 100;
 
+		// Mark as estimated when we only have heuristic values (no provider usage in the last message)
+		const estimated = estimate.usageTokens === 0;
+
 		return {
 			tokens: estimate.tokens,
 			contextWindow,
 			percent,
+			estimated,
 		};
 	}
 

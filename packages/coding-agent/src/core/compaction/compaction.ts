@@ -226,63 +226,100 @@ export function shouldCompact(contextTokens: number, contextWindow: number, sett
 // ============================================================================
 
 /**
- * Estimate token count for a message using chars/4 heuristic.
- * This is conservative (overestimates tokens).
+ * Estimate token count for a string, accounting for CJK characters which
+ * typically require 2-3 tokens per character instead of the ~0.25 implied
+ * by chars/4.
+ *
+ * The heuristic: CJK chars count as 2 tokens, others count as ~0.25 tokens.
+ * This produces much more accurate estimates for mixed-language content.
+ */
+function estimateStringTokens(text: string): number {
+	let tokens = 0;
+	for (let i = 0; i < text.length; i++) {
+		const code = text.charCodeAt(i);
+		// CJK Unified Ideographs, CJK Extension A-I, Katakana, Hiragana, Hangul, Fullwidth, CJK Symbols
+		if (
+			(code >= 0x4e00 && code <= 0x9fff) || // CJK Unified Ideographs
+			(code >= 0x3400 && code <= 0x4dbf) || // CJK Extension A
+			(code >= 0xf900 && code <= 0xfaff) || // CJK Compatibility Ideographs
+			(code >= 0x3040 && code <= 0x309f) || // Hiragana
+			(code >= 0x30a0 && code <= 0x30ff) || // Katakana
+			(code >= 0xac00 && code <= 0xd7af) || // Hangul Syllables
+			(code >= 0xff00 && code <= 0xffef) || // Fullwidth Forms
+			(code >= 0x3000 && code <= 0x303f) // CJK Symbols and Punctuation
+		) {
+			tokens += 2;
+		} else if (code >= 0xd800 && code <= 0xdbff) {
+			// High surrogate — skip the low surrogate in the next iteration
+			tokens += 2; // assume CJK for surrogate pairs (emoji etc.)
+			i++; // skip low surrogate
+		} else {
+			tokens += 0.25; // ~4 chars per token for Latin text
+		}
+	}
+	return Math.max(1, Math.ceil(tokens));
+}
+
+/**
+ * Estimate token count for a message.
+ *
+ * Uses Unicode-aware token estimation for text content, which produces
+ * significantly more accurate results than the old chars/4 heuristic for
+ * CJK-heavy content. For English and code, the estimates remain conservative.
  */
 export function estimateTokens(message: AgentMessage): number {
-	let chars = 0;
+	let text = "";
+	let imageCount = 0;
 
 	switch (message.role) {
 		case "user": {
 			const content = (message as { content: string | Array<{ type: string; text?: string }> }).content;
 			if (typeof content === "string") {
-				chars = content.length;
+				text = content;
 			} else if (Array.isArray(content)) {
 				for (const block of content) {
 					if (block.type === "text" && block.text) {
-						chars += block.text.length;
+						text += block.text;
 					}
 				}
 			}
-			return Math.ceil(chars / 4);
+			return estimateStringTokens(text);
 		}
 		case "assistant": {
 			const assistant = message as AssistantMessage;
 			for (const block of assistant.content) {
 				if (block.type === "text") {
-					chars += block.text.length;
+					text += block.text;
 				} else if (block.type === "thinking") {
-					chars += block.thinking.length;
+					text += block.thinking;
 				} else if (block.type === "toolCall") {
-					chars += block.name.length + JSON.stringify(block.arguments).length;
+					text += block.name + JSON.stringify(block.arguments);
 				}
 			}
-			return Math.ceil(chars / 4);
+			return estimateStringTokens(text);
 		}
 		case "custom":
 		case "toolResult": {
 			if (typeof message.content === "string") {
-				chars = message.content.length;
+				text = message.content;
 			} else {
 				for (const block of message.content) {
 					if (block.type === "text" && block.text) {
-						chars += block.text.length;
+						text += block.text;
 					}
 					if (block.type === "image") {
-						chars += 4800; // Estimate images as 4000 chars, or 1200 tokens
+						imageCount++;
 					}
 				}
 			}
-			return Math.ceil(chars / 4);
+			return estimateStringTokens(text) + imageCount * 1200;
 		}
 		case "bashExecution": {
-			chars = message.command.length + message.output.length;
-			return Math.ceil(chars / 4);
+			return estimateStringTokens(message.command + message.output);
 		}
 		case "branchSummary":
 		case "compactionSummary": {
-			chars = message.summary.length;
-			return Math.ceil(chars / 4);
+			return estimateStringTokens(message.summary);
 		}
 	}
 

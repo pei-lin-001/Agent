@@ -83,10 +83,11 @@ export class FooterComponent implements Component {
 		}
 
 		// Calculate context usage from session (handles compaction correctly).
-		// After compaction, tokens are unknown until the next LLM response.
+		// After compaction, falls back to token estimation instead of showing "?".
 		const contextUsage = this.session.getContextUsage();
 		const contextWindow = contextUsage?.contextWindow ?? state.model?.contextWindow ?? 0;
 		const contextPercentValue = contextUsage?.percent ?? 0;
+		const estimated = contextUsage?.estimated ?? false;
 		const contextPercent = contextUsage?.percent !== null ? contextPercentValue.toFixed(1) : "?";
 
 		// Replace home directory with ~
@@ -125,10 +126,15 @@ export class FooterComponent implements Component {
 		// Colorize context percentage based on usage
 		let contextPercentStr: string;
 		const autoIndicator = this.autoCompactEnabled ? " (auto)" : "";
-		const contextPercentDisplay =
-			contextPercent === "?"
-				? `?/${formatTokens(contextWindow)}${autoIndicator}`
-				: `${contextPercent}%/${formatTokens(contextWindow)}${autoIndicator}`;
+		// Show "~85k/203k" for estimates, "42.1%/203k" for actual provider data
+		const contextUsageTokens = contextUsage?.tokens ?? 0;
+		const displayVal =
+			estimated && contextUsageTokens > 0
+				? `~${formatTokens(contextUsageTokens)}`
+				: contextPercent === "?"
+					? "?"
+					: `${contextPercent}%`;
+		const contextPercentDisplay = `${displayVal}/${formatTokens(contextWindow)}${autoIndicator}`;
 		if (contextPercentValue > 90) {
 			contextPercentStr = theme.fg("error", contextPercentDisplay);
 		} else if (contextPercentValue > 70) {

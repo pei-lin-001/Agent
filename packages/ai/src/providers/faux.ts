@@ -126,7 +126,28 @@ export interface FauxProviderRegistration {
 }
 
 function estimateTokens(text: string): number {
-	return Math.ceil(text.length / 4);
+	let tokens = 0;
+	for (let i = 0; i < text.length; i++) {
+		const code = text.charCodeAt(i);
+		if (
+			(code >= 0x4e00 && code <= 0x9fff) || // CJK Unified Ideographs
+			(code >= 0x3400 && code <= 0x4dbf) || // CJK Extension A
+			(code >= 0xf900 && code <= 0xfaff) || // CJK Compatibility Ideographs
+			(code >= 0x3040 && code <= 0x309f) || // Hiragana
+			(code >= 0x30a0 && code <= 0x30ff) || // Katakana
+			(code >= 0xac00 && code <= 0xd7af) || // Hangul Syllables
+			(code >= 0xff00 && code <= 0xffef) || // Fullwidth Forms
+			(code >= 0x3000 && code <= 0x303f) // CJK Symbols and Punctuation
+		) {
+			tokens += 2;
+		} else if (code >= 0xd800 && code <= 0xdbff) {
+			tokens += 2;
+			i++; // skip low surrogate
+		} else {
+			tokens += 0.25;
+		}
+	}
+	return Math.max(1, Math.ceil(tokens));
 }
 
 function randomId(prefix: string): string {

@@ -282,6 +282,8 @@ export interface ContextUsage {
 	contextWindow: number;
 	/** Context usage as percentage of context window, or null if tokens is unknown. */
 	percent: number | null;
+	/** Whether the values are estimated (not from provider-returned usage). */
+	estimated?: boolean;
 }
 
 export interface CompactOptions {
