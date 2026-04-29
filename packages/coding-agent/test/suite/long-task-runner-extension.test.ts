@@ -42,6 +42,7 @@ type LongTaskToolParams = {
 	artifact?: string;
 	stepArtifacts?: string[];
 	notes?: string;
+	force?: boolean;
 };
 
 interface FakeToolResult {
@@ -1070,5 +1071,168 @@ describe("long task runner extension", () => {
 		await commands.get("task")!("list", ctx);
 		const notification = ctx.ui.notifications.at(-1)?.message ?? "";
 		expect(notification).toContain("Active");
+	});
+
+	// ── Dedup / matching fixes ─────────────────────────────────────────
+
+	it("different goals do not match — creates separate tasks", async () => {
+		const cwd = createTempDir();
+		tempDirs.push(cwd);
+		const { tools } = createExtensionHarness();
+		const longTaskTool = tools.get("long_task");
+		expect(longTaskTool).toBeDefined();
+
+		// Create first task with a specific goal
+		await longTaskTool!.execute(
+			"tc-1",
+			{ action: "create", goal: "Personal Agent Multi-Capability Collaborative Platform Evolution" },
+			undefined,
+			undefined,
+			{ cwd },
+		);
+
+		// Create second task with a completely different goal
+		const secondResult = await longTaskTool!.execute(
+			"tc-2",
+			{ action: "create", goal: "Research Hermes gateway architecture and implement gateway extension" },
+			undefined,
+			undefined,
+			{ cwd },
+		);
+
+		expect(secondResult.content[0]!.text).toContain("Created long task");
+		expect(secondResult.content[0]!.text).not.toContain("Reused");
+	});
+
+	it("genuinely duplicate goal reuses existing task", async () => {
+		const cwd = createTempDir();
+		tempDirs.push(cwd);
+		const { tools } = createExtensionHarness();
+		const longTaskTool = tools.get("long_task");
+
+		await longTaskTool!.execute(
+			"tc-1",
+			{ action: "create", goal: "Add Ollama Cloud provider support to pi-ai" },
+			undefined,
+			undefined,
+			{ cwd },
+		);
+
+		const secondResult = await longTaskTool!.execute(
+			"tc-2",
+			{ action: "create", goal: "Add Ollama Cloud provider support to pi-ai" },
+			undefined,
+			undefined,
+			{ cwd },
+		);
+
+		expect(secondResult.content[0]!.text).toContain("Reused");
+	});
+
+	it("force=true creates a new task even when a similar one exists", async () => {
+		const cwd = createTempDir();
+		tempDirs.push(cwd);
+		const { tools } = createExtensionHarness();
+		const longTaskTool = tools.get("long_task");
+
+		await longTaskTool!.execute(
+			"tc-1",
+			{ action: "create", goal: "Add Ollama Cloud provider support to pi-ai" },
+			undefined,
+			undefined,
+			{ cwd },
+		);
+
+		const forceResult = await longTaskTool!.execute(
+			"tc-2",
+			{ action: "create", goal: "Add Ollama Cloud provider support to pi-ai", force: true },
+			undefined,
+			undefined,
+			{ cwd },
+		);
+
+		expect(forceResult.content[0]!.text).toContain("Created long task");
+		expect(forceResult.content[0]!.text).not.toContain("Reused");
+	});
+
+	it("stale active task (not updated in >7 days) does not block new task creation", async () => {
+		const cwd = createTempDir();
+		tempDirs.push(cwd);
+		const { tools } = createExtensionHarness();
+		const longTaskTool = tools.get("long_task");
+
+		// Create task and manually backdate its updatedAt to 10 days ago
+		const task = createLongTask(cwd, "Add Ollama Cloud provider support to pi-ai");
+		const tenDaysAgo = new Date(Date.now() - 10 * 86_400_000).toISOString();
+		const taskPath = join(getTaskStorageDir(cwd), `${task.id}.json`);
+		const taskData = JSON.parse(readFileSync(taskPath, "utf-8"));
+		taskData.updatedAt = tenDaysAgo;
+		writeFileSync(taskPath, JSON.stringify(taskData, null, 2));
+
+		const secondResult = await longTaskTool!.execute(
+			"tc-2",
+			{ action: "create", goal: "Add Ollama Cloud provider support to pi-ai" },
+			undefined,
+			undefined,
+			{ cwd },
+		);
+
+		expect(secondResult.content[0]!.text).toContain("Created long task");
+		expect(secondResult.content[0]!.text).not.toContain("Reused");
+	});
+
+	it("/task create --force bypasses duplicate detection", async () => {
+		const cwd = createTempDir();
+		tempDirs.push(cwd);
+		const { commands } = createExtensionHarness();
+		const ctx = createFakeContext(cwd);
+
+		createLongTask(cwd, "Add regression tests for memory dedup");
+
+		await commands.get("task")!("create --force Add regression tests for memory dedup", ctx);
+
+		const notification = ctx.ui.notifications.at(-1)?.message ?? "";
+		expect(notification).toContain("Created long task");
+		expect(notification).not.toContain("Reused");
+	});
+
+	it("matching uses title+goal only — different goals with shared step keywords create separate tasks", async () => {
+		const cwd = createTempDir();
+		tempDirs.push(cwd);
+		const { tools } = createExtensionHarness();
+		const longTaskTool = tools.get("long_task");
+
+		// Create a task whose title/goal is about "personal agent platform"
+		// but whose steps mention "gateway"
+		const first = await longTaskTool!.execute(
+			"tc-1",
+			{ action: "create", goal: "Evolve the personal agent platform" },
+			undefined,
+			undefined,
+			{ cwd },
+		);
+		const taskId = first.content[0]!.text.match(/id: ([^\n]+)/)?.[1];
+
+		await longTaskTool!.execute(
+			"tc-2",
+			{ action: "add_step", taskId, title: "Research Hermes gateway architecture", worker: "researcher" },
+			undefined,
+			undefined,
+			{ cwd },
+		);
+
+		// Try to create a NEW task about gateway — should succeed
+		// because the existing task's title+goal is "personal agent platform",
+		// not about "gateway" at all
+		const secondResult = await longTaskTool!.execute(
+			"tc-3",
+			{ action: "create", goal: "Implement HTTP gateway tunnel for external service connections" },
+			undefined,
+			undefined,
+			{ cwd },
+		);
+
+		expect(secondResult.content[0]!.text).toContain("Created long task");
+		expect(secondResult.content[0]!.text).not.toContain("Reused");
 	});
 });

@@ -200,6 +200,23 @@ export function estimateContextTokens(messages: AgentMessage[]): ContextUsageEst
 	}
 
 	const usageTokens = calculateContextTokens(usageInfo.usage);
+
+	// If provider returned a usage object but all fields are zero, treat it as invalid.
+	// This happens with providers like Ollama Cloud that return {input:0, output:0, totalTokens:0}.
+	// Fall back to heuristic estimation instead of reporting 0 tokens.
+	if (usageTokens <= 0) {
+		let estimated = 0;
+		for (const message of messages) {
+			estimated += estimateTokens(message);
+		}
+		return {
+			tokens: estimated,
+			usageTokens: 0,
+			trailingTokens: estimated,
+			lastUsageIndex: null,
+		};
+	}
+
 	let trailingTokens = 0;
 	for (let i = usageInfo.index + 1; i < messages.length; i++) {
 		trailingTokens += estimateTokens(messages[i]);

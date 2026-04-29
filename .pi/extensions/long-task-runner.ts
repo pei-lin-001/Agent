@@ -115,6 +115,7 @@ const LongTaskToolParams = Type.Object({
 	artifact: Type.Optional(Type.String({ description: "Artifact path, URL, or note for add_artifact." })),
 	stepArtifacts: Type.Optional(Type.Array(Type.String(), { description: "Step-level artifacts when calling set_step (file paths, URLs, or notes produced by the step)." })),
 	notes: Type.Optional(Type.String({ description: "Optional freeform notes to attach to the step when calling set_step." })),
+	force: Type.Optional(Type.Boolean({ description: "Skip duplicate detection when creating a task. Use when the user explicitly wants a new task regardless of existing matches." })),
 });
 
 function nowIso(): string {
@@ -322,7 +323,7 @@ export function updateStepStatus(
 	if (status === "completed" && message?.trim()) {
 		step.output = message.trim();
 	}
-	if (status === "failed" && message?.trim()) {
+	if ((status === "failed" || status === "blocked") && message?.trim()) {
 		step.error = message.trim();
 	}
 	if (stepArtifacts?.length) {
@@ -385,6 +386,7 @@ function isActiveTask(task: LongTaskRecord): boolean {
 	return task.status === "pending" || task.status === "running" || task.status === "blocked";
 }
 
+/** Full text for display/debug — includes all history. */
 function taskSearchText(task: LongTaskRecord): string {
 	return [
 		task.title,
@@ -393,6 +395,11 @@ function taskSearchText(task: LongTaskRecord): string {
 		...task.artifacts,
 		...task.memoryKeys,
 	].join(" ");
+}
+
+/** Title + goal only — used for dedup matching to avoid false positives from accumulated step text. */
+function taskSearchTextForMatch(task: LongTaskRecord): string {
+	return [task.title, task.goal].join(" ");
 }
 
 function stepSearchText(step: LongTaskStep): string {
@@ -419,6 +426,13 @@ const MATCH_STOP_WORDS = new Set([
 	"implementation",
 	"layer",
 	"mvp",
+	"agent",
+	"system",
+	"platform",
+	"extension",
+	"support",
+	"project",
+	"feature",
 	"个人",
 	"任务",
 	"长期",
@@ -426,6 +440,12 @@ const MATCH_STOP_WORDS = new Set([
 	"创建",
 	"纳入",
 	"第一版",
+	"项目",
+	"功能",
+	"支持",
+	"修改",
+	"改进",
+	"更新",
 ]);
 
 function tokenizeForMatch(text: string): Set<string> {
@@ -437,65 +457,35 @@ function tokenizeForMatch(text: string): Set<string> {
 			continue;
 		}
 		tokens.add(token);
-		addTokenAliases(tokens, token);
 	}
-	addPhraseAliases(tokens, normalized);
 	return tokens;
 }
 
-function addTokenAliases(tokens: Set<string>, token: string): void {
-	const aliases: Record<string, string[]> = {
-		dispatcher: ["dispatch", "dispatch-scope"],
-		dispatch: ["dispatch-scope"],
-		orchestration: ["orchestrate", "dispatch-scope"],
-		orchestrator: ["orchestrate", "dispatch-scope"],
-		routing: ["route", "dispatch-scope"],
-		router: ["route", "dispatch-scope"],
-		roles: ["role", "dispatch-scope"],
-		role: ["dispatch-scope"],
-		context: ["dispatch-scope"],
-		result: ["dispatch-scope"],
-		results: ["result", "dispatch-scope"],
-		merging: ["merge", "dispatch-scope"],
-		merge: ["dispatch-scope"],
-		complexity: ["dispatch-scope"],
-		classification: ["dispatch-scope"],
-	};
-	for (const alias of aliases[token] ?? []) {
-		tokens.add(alias);
-	}
-}
 
-function addPhraseAliases(tokens: Set<string>, normalized: string): void {
-	const phraseAliases: Array<[RegExp, string[]]> = [
-		[/multi\s+agent|多\s*agent|多智能体|多代理/, ["multi", "agent", "dispatch-scope"]],
-		[/协作编排|编排层|调度层|调度/, ["orchestrate", "dispatch", "dispatch-scope"]],
-		[/路由|分流/, ["route", "dispatch-scope"]],
-		[/角色|职责/, ["role", "dispatch-scope"]],
-		[/上下文/, ["context", "dispatch-scope"]],
-		[/结果合并|合并/, ["merge", "result", "dispatch-scope"]],
-		[/复杂度|分类/, ["complexity", "classification", "dispatch-scope"]],
-	];
-	for (const [pattern, aliases] of phraseAliases) {
-		if (pattern.test(normalized)) {
-			for (const alias of aliases) {
-				tokens.add(alias);
-			}
-		}
-	}
-}
 
-function findMatchingActiveTask(cwd: string, text: string): LongTaskRecord | undefined {
+const MATCH_STALE_DAYS = 7;
+const MATCH_MS_PER_DAY = 86_400_000;
+const MATCH_MIN_OVERLAP = 3;
+const MATCH_MIN_RATIO = 0.4;
+
+function findMatchingActiveTask(cwd: string, text: string, force?: boolean): LongTaskRecord | undefined {
+	if (force) return undefined;
 	const queryTokens = tokenizeForMatch(text);
 	if (queryTokens.size === 0) {
 		return undefined;
 	}
-	let bestMatch: { task: LongTaskRecord; overlap: number } | undefined;
+	let bestMatch: { task: LongTaskRecord; overlap: number; ratio: number } | undefined;
 	for (const task of listTasks(cwd).filter(isActiveTask)) {
-		const taskTokens = tokenizeForMatch(taskSearchText(task));
+		// Skip stale tasks — not updated in MATCH_STALE_DAYS days
+		const daysSinceUpdate = (Date.now() - new Date(task.updatedAt).getTime()) / MATCH_MS_PER_DAY;
+		if (daysSinceUpdate > MATCH_STALE_DAYS) continue;
+
+		const taskTokens = tokenizeForMatch(taskSearchTextForMatch(task));
+		if (taskTokens.size === 0) continue;
 		const overlap = [...queryTokens].filter((token) => taskTokens.has(token)).length;
-		if (overlap >= 2 && (!bestMatch || overlap > bestMatch.overlap)) {
-			bestMatch = { task, overlap };
+		const ratio = overlap / Math.min(queryTokens.size, taskTokens.size);
+		if (overlap >= MATCH_MIN_OVERLAP && ratio >= MATCH_MIN_RATIO && (!bestMatch || overlap > bestMatch.overlap)) {
+			bestMatch = { task, overlap, ratio };
 		}
 	}
 	return bestMatch?.task;
@@ -714,9 +704,9 @@ export function buildTaskRoutingSystemPrompt(cwd: string, userPrompt: string): s
 		`Default mode: ${config.defaultMode ?? "immediate"}.`,
 		"Keep simple requests in immediate mode. Do not create long-task records for direct questions, small edits, or one-off commands.",
 		"Use the long_task tool only when work is complex, multi-step, interruptible, long-running, or explicitly asks for tracked/background progress.",
-		"Before creating a new long task, check the active long tasks below. If one already covers the user's request, reuse it by showing, resuming, or updating that existing task instead of creating a duplicate.",
+		"Before creating a new long task, check the active long tasks below. Only reuse an existing task if it clearly covers the same goal — when in doubt, create a new task.",
 		"When an active task has a next pending/running step matching the user's request, continue that step and use the exact task id from the active task list.",
-		"Create a new long task only when no active task matches the goal.",
+		"Use force=true when calling long_task create to skip duplicate detection and always create a new task.",
 		"When calling long_task suggest_steps or add_suggested_steps, pass the original user request as sourcePrompt, not a shortened goal summary. The classifier needs the original prompt to detect multi-agent signals.",
 		config.askWhenAmbiguous !== false
 			? "If a request is ambiguous and tracking would add overhead, ask the user before creating a long task."
@@ -742,8 +732,8 @@ export function buildTaskRoutingSystemPrompt(cwd: string, userPrompt: string): s
 			: "Dispatch step drafts: none",
 		"Recommendation usage:",
 		"- answer_directly: answer without long_task unless the user explicitly asks to track it.",
-		"- use_long_task: use or create a long_task, reusing an active matching task first.",
-		"- plan_multi_agent: keep the lead agent in control; create or reuse a long_task and plan worker roles, but do not spawn workers yet.",
+		"- use_long_task: create a new long_task, or reuse an active task only if it clearly covers the same goal.",
+		"- plan_multi_agent: keep the lead agent in control; create a new long_task (or reuse one only if clearly the same goal) and plan worker roles, but do not spawn workers yet.",
 		"Worker plan hints are planning guidance. Use the worker_execute tool to run researcher and reviewer workers. Coder, tester, and docWriter workers are available for later phases.",
 		"Step drafts are suggestions only; do not add them to long_task unless the user asks to track or continue the task.",
 		activeTaskLines.length > 0 ? `Active long tasks:\n${activeTaskLines.join("\n")}` : "Active long tasks: none.",
@@ -761,7 +751,7 @@ function notify(ctx: ExtensionCommandContext, message: string, type: "info" | "w
 function helpText(): string {
 	return [
 		"Usage:",
-		"/task create <goal>",
+		"/task create [--force] <goal>",
 		"/task list",
 		"/task show <taskId>",
 		"/task add-step <taskId> <title>",
@@ -797,6 +787,7 @@ function executeLongTaskAction(
 		artifact?: string;
 		stepArtifacts?: string[];
 		notes?: string;
+		force?: boolean;
 	},
 ): { text: string; details: unknown } {
 	if (!isEnabled(cwd)) {
@@ -837,7 +828,8 @@ function executeLongTaskAction(
 	}
 	if (params.action === "create") {
 		const goal = requireString(params.goal, "goal");
-		const matchingTask = findMatchingActiveTask(cwd, [goal, params.title ?? ""].join(" "));
+		const force = !!params.force;
+		const matchingTask = findMatchingActiveTask(cwd, [goal, params.title ?? ""].join(" "), force);
 		if (matchingTask) {
 			return {
 				text: `Reused existing long task instead of creating a duplicate\n${formatTaskSummary(matchingTask)}`,
@@ -908,8 +900,9 @@ async function handleTaskCommand(args: string, ctx: ExtensionCommandContext): Pr
 			throw new Error("Long-task runner is disabled by .pi/task-router.config.json");
 		}
 		if (parsed.action === "create") {
-			const goal = parsed.args.join(" ");
-			const matchingTask = findMatchingActiveTask(ctx.cwd, goal);
+			const hasForce = parsed.args.includes("--force");
+			const goal = parsed.args.filter((a) => a !== "--force").join(" ");
+			const matchingTask = findMatchingActiveTask(ctx.cwd, goal, hasForce);
 			if (matchingTask) {
 				notify(ctx, `Reused existing long task instead of creating a duplicate\n${formatTaskSummary(matchingTask)}`);
 				return;
@@ -1014,7 +1007,7 @@ export default function longTaskRunnerExtension(pi: ExtensionAPI) {
 		promptGuidelines: [
 			"Use long_task only for complex, multi-step, long-running, interruptible, or explicitly requested tracked work.",
 			"Do not use long_task for simple questions, small one-off edits, or quick command execution.",
-			"Before create or add_step, inspect active task state and reuse an existing matching task or step instead of duplicating it.",
+			"Before create or add_step, inspect active task state and reuse an existing matching task or step only if clearly the same goal.",
 			"Use long_task with action create before tracking a new long-running task, then add_step and set_step as progress is made.",
 			"Use long_task add_artifact to attach important files, URLs, notes, or outputs to the task record.",
 			"Use long_task suggest_steps to preview step drafts for a goal without writing anything. Always pass the original user request as sourcePrompt, not a shortened goal summary.",
